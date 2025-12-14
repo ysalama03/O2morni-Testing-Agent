@@ -38,7 +38,7 @@ const ChatPanel = ({ onSendMessage, messages = [] }) => {
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyPress={handleKeyPress}
+          onKeyDown={handleKeyPress}
           placeholder="Ask the agent to generate tests or interact with the browser..."
           rows={3}
         />

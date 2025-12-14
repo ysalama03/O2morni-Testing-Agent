@@ -9,9 +9,6 @@ const BrowserView = ({ screenshot, url, loading = false }) => {
     <div className="browser-view">
       <div className="browser-header">
         <h2>Browser View</h2>
-        <div className="browser-url">
-          {url && <span>Current URL: {url}</span>}
-        </div>
       </div>
       <div className="browser-content">
         {loading && <div className="loading-spinner">Loading browser state...</div>}

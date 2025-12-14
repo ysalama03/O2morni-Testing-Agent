@@ -80,6 +80,9 @@ body {
   background-color: #b7d6f5;
   color: black;
   padding: 1rem;
+  height: 60px;
+  display: flex;
+  align-items: center;
 }
 
 .chat-header h2 {
@@ -135,7 +138,7 @@ body {
   flex: 1;
   padding: 0.5rem;
   border: 1px solid #ddd;
-  border-radius: 4px;
+  border-radius: 20px;
   resize: none;
   font-family: inherit;
 }
@@ -145,7 +148,7 @@ body {
   background-color: #b7d6f5;
   color: black;
   border: none;
-  border-radius: 4px;
+  border-radius: 20px;
   cursor: pointer;
   font-weight: bold;
 }
@@ -165,6 +168,9 @@ body {
   background-color: #b7d6f5;
   color: black;
   padding: 1rem;
+  height: 60px;
+  display: flex;
+  align-items: center;
 }
 
 .browser-header h2 {
@@ -213,6 +219,9 @@ body {
   background-color: #b7d6f5;
   color: black;
   padding: 1rem;
+  height: 60px;
+  display: flex;
+  align-items: center;
 }
 
 .metrics-header h2 {
