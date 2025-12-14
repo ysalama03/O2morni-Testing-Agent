@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Build outputs
+frontend/build/
+dist/
+*.tgz
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Testing
+coverage/
+.nyc_output/
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/
+
+# Generated files (keep directory structure but ignore contents except README)
+generated_tests/*.spec.js
+generated_tests/*.test.js
+reports/*.json
+reports/*.png
+reports/*.jpg
+
+# Keep the README files
+!generated_tests/README.md
+!reports/README.md
+
+# Temporary files
+tmp/
+temp/
+*.tmp
