@@ -63,8 +63,11 @@ const Dashboard = () => {
   return (
     <div className="dashboard">
       <header className="dashboard-header">
-        <h1>Web-based Testing Agent</h1>
-        <p>Human-in-the-Loop Testing Assistant</p>
+        <img src="/logo.png" alt="O2morni Logo" className="dashboard-logo" />
+        <div className="dashboard-header-text">
+          <h1>O2morni Testing Agent</h1>
+          <p>Bani Adam-in-the-Loop Testing Assistant</p>
+        </div>
       </header>
       <div className="dashboard-layout">
         <div className="dashboard-left">
