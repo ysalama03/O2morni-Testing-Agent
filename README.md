@@ -1,4 +1,4 @@
-# Web-based Testing Agent
+# O2morni Testing Agent
 
 A comprehensive web-based testing solution that combines LLM-powered test generation with human-in-the-loop interaction. This tool enables automated web testing with real-time browser control, test generation, execution, and observability.
 
