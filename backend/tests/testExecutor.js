@@ -38,15 +38,54 @@ async function executeTest(testPath, options = {}) {
 
     const startTime = Date.now();
     
-    // Execute the test using Playwright
+    // Validate test path to prevent command injection
+    const safePath = path.basename(testPath);
+    if (safePath !== testPath || testPath.includes('..') || testPath.includes(';') || testPath.includes('&')) {
+      return {
+        success: false,
+        error: 'Invalid test path'
+      };
+    }
+    
+    // Execute the test using Playwright with safe arguments
     // In production, this would use proper test runner integration
-    const command = `npx playwright test ${fullPath} --reporter=json`;
+    const { spawn } = require('child_process');
     
     let result;
     try {
-      const { stdout, stderr } = await execAsync(command, {
+      // Use spawn with array arguments to prevent command injection
+      const testProcess = spawn('npx', ['playwright', 'test', fullPath, '--reporter=json'], {
         cwd: path.join(__dirname, '../..'),
         timeout: 60000
+      });
+      
+      let stdout = '';
+      let stderr = '';
+      
+      testProcess.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+      
+      testProcess.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+      
+      await new Promise((resolve, reject) => {
+        testProcess.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`Test process exited with code ${code}`));
+          }
+        });
+        
+        testProcess.on('error', reject);
+        
+        // Timeout handling
+        setTimeout(() => {
+          testProcess.kill();
+          reject(new Error('Test execution timeout'));
+        }, 60000);
       });
       
       result = {

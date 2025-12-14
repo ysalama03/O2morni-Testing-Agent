@@ -57,15 +57,19 @@ async function generateTest(config) {
  * @returns {string} Generated test code
  */
 function generateTestCode(testName, url, actions, assertions) {
-  const code = `// Generated test: ${testName}
+  // Sanitize inputs to prevent code injection
+  const sanitizedTestName = sanitizeString(testName);
+  const sanitizedUrl = sanitizeUrl(url);
+  
+  const code = `// Generated test: ${sanitizedTestName}
 // Generated at: ${new Date().toISOString()}
 
 const { test, expect } = require('@playwright/test');
 
-test.describe('${testName}', () => {
+test.describe('${sanitizedTestName}', () => {
   test('should execute test scenario', async ({ page }) => {
     // Navigate to the target URL
-    await page.goto('${url || 'about:blank'}');
+    await page.goto('${sanitizedUrl}');
     
     // Perform actions
 ${actions.map((action, index) => generateActionCode(action, index)).join('\n')}
@@ -80,6 +84,33 @@ ${assertions.map((assertion, index) => generateAssertionCode(assertion, index)).
 }
 
 /**
+ * Sanitize string to prevent code injection
+ * @param {string} str - String to sanitize
+ * @returns {string} Sanitized string
+ */
+function sanitizeString(str) {
+  if (!str) return '';
+  return str.replace(/['"\\]/g, '\\$&').replace(/\n/g, '\\n');
+}
+
+/**
+ * Validate and sanitize URL
+ * @param {string} url - URL to sanitize
+ * @returns {string} Sanitized URL
+ */
+function sanitizeUrl(url) {
+  if (!url) return 'about:blank';
+  
+  // Basic URL validation
+  try {
+    new URL(url);
+    return url.replace(/['"\\]/g, '\\$&');
+  } catch {
+    return 'about:blank';
+  }
+}
+
+/**
  * Generate code for a single action
  * @param {Object} action - Action configuration
  * @param {number} index - Action index
@@ -87,20 +118,22 @@ ${assertions.map((assertion, index) => generateAssertionCode(assertion, index)).
  */
 function generateActionCode(action, index) {
   const { type, selector, value, options } = action;
+  const sanitizedSelector = sanitizeString(selector || '');
+  const sanitizedValue = sanitizeString(value || '');
   
   switch (type) {
     case 'click':
-      return `    await page.click('${selector}');`;
+      return `    await page.click('${sanitizedSelector}');`;
     case 'type':
-      return `    await page.fill('${selector}', '${value}');`;
+      return `    await page.fill('${sanitizedSelector}', '${sanitizedValue}');`;
     case 'press':
-      return `    await page.press('${selector}', '${value}');`;
+      return `    await page.press('${sanitizedSelector}', '${sanitizedValue}');`;
     case 'select':
-      return `    await page.selectOption('${selector}', '${value}');`;
+      return `    await page.selectOption('${sanitizedSelector}', '${sanitizedValue}');`;
     case 'wait':
-      return `    await page.waitForTimeout(${value || 1000});`;
+      return `    await page.waitForTimeout(${parseInt(value) || 1000});`;
     case 'waitForSelector':
-      return `    await page.waitForSelector('${selector}');`;
+      return `    await page.waitForSelector('${sanitizedSelector}');`;
     default:
       return `    // Unknown action type: ${type}`;
   }
@@ -114,18 +147,20 @@ function generateActionCode(action, index) {
  */
 function generateAssertionCode(assertion, index) {
   const { type, selector, expected } = assertion;
+  const sanitizedSelector = sanitizeString(selector || '');
+  const sanitizedExpected = sanitizeString(expected || '');
   
   switch (type) {
     case 'visible':
-      return `    await expect(page.locator('${selector}')).toBeVisible();`;
+      return `    await expect(page.locator('${sanitizedSelector}')).toBeVisible();`;
     case 'text':
-      return `    await expect(page.locator('${selector}')).toHaveText('${expected}');`;
+      return `    await expect(page.locator('${sanitizedSelector}')).toHaveText('${sanitizedExpected}');`;
     case 'value':
-      return `    await expect(page.locator('${selector}')).toHaveValue('${expected}');`;
+      return `    await expect(page.locator('${sanitizedSelector}')).toHaveValue('${sanitizedExpected}');`;
     case 'url':
-      return `    expect(page.url()).toBe('${expected}');`;
+      return `    expect(page.url()).toBe('${sanitizedExpected}');`;
     case 'title':
-      return `    await expect(page).toHaveTitle('${expected}');`;
+      return `    await expect(page).toHaveTitle('${sanitizedExpected}');`;
     default:
       return `    // Unknown assertion type: ${type}`;
   }

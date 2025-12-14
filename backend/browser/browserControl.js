@@ -98,7 +98,7 @@ async function navigateTo(url) {
   }
 
   try {
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
     return {
       success: true,
       url: page.url(),

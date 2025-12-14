@@ -1,18 +1,10 @@
-import React, { useEffect, useRef } from 'react';
+import React from 'react';
 
 /**
  * BrowserView Component
  * Displays the live browser state or screenshots from Playwright
  */
 const BrowserView = ({ screenshot, url, loading = false }) => {
-  const iframeRef = useRef(null);
-
-  useEffect(() => {
-    if (url && iframeRef.current) {
-      // Update iframe if needed
-    }
-  }, [url]);
-
   return (
     <div className="browser-view">
       <div className="browser-header">
