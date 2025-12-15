@@ -42,7 +42,9 @@ const ChatPanel = ({ onSendMessage, messages = [] }) => {
           placeholder="Ask the agent to generate tests or interact with the browser..."
           rows={3}
         />
-        <button onClick={handleSend}>Send</button>
+        <button onClick={handleSend}>
+          <img src="/right-arrow-svgrepo-com.svg" alt="Send" className="send-icon" />
+        </button>
       </div>
     </div>
   );
