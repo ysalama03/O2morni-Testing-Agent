@@ -81,10 +81,8 @@ const Dashboard = () => {
             screenshot={browserState.screenshot}
             url={browserState.url}
             loading={browserState.loading}
+            metrics={metrics}
           />
-        </div>
-        <div className="dashboard-right">
-          <MetricsPanel metrics={metrics} />
         </div>
       </div>
     </div>

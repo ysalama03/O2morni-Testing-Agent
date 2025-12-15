@@ -11,6 +11,8 @@ const MetricsPanel = ({ metrics = {} }) => {
     testsFailed = 0,
     executionTime = 0,
     coverage = 0,
+    averageResponseTime = 0,
+    tokensConsumed = 0,
     errors = []
   } = metrics;
 
@@ -20,9 +22,6 @@ const MetricsPanel = ({ metrics = {} }) => {
 
   return (
     <div className="metrics-panel">
-      <div className="metrics-header">
-        <h2>Test Metrics</h2>
-      </div>
       <div className="metrics-grid">
         <div className="metric-card">
           <div className="metric-label">Tests Run</div>
@@ -47,6 +46,14 @@ const MetricsPanel = ({ metrics = {} }) => {
         <div className="metric-card">
           <div className="metric-label">Coverage</div>
           <div className="metric-value">{coverage}%</div>
+        </div>
+        <div className="metric-card">
+          <div className="metric-label">Avg Response Time</div>
+          <div className="metric-value">{averageResponseTime}ms</div>
+        </div>
+        <div className="metric-card">
+          <div className="metric-label">Tokens Consumed</div>
+          <div className="metric-value">{tokensConsumed}</div>
         </div>
       </div>
       {errors.length > 0 && (
