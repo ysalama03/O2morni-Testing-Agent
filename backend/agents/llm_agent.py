@@ -972,10 +972,10 @@ class LLMAgent:
     Phase 3: Implementation - Generate test code with smart locator strategy
     Phase 4: Verification - Execute tests and provide evidence
     
-    Models:
-    - Qwen2-VL-72B: Visual web reasoning and understanding screenshots
-    - DeepSeek-Coder-V2-Instruct: Test code generation
-    - Llama-3.1-70B-Instruct: General orchestration and reasoning
+    Models (Free Tier):
+    - Qwen2-VL-7B-Instruct: Visual web reasoning and understanding screenshots
+    - Starcoder2-15B: Test code generation
+    - Llama-3.1-8B-Instruct: General orchestration and reasoning
     """
     
     def __init__(self, browser_controller=None):
@@ -1009,19 +1009,19 @@ class LLMAgent:
             raise ValueError("Browser controller is required for initialization")
         
         try:
-            # Initialize models
+            # Initialize models (using free-tier models to avoid payment limits)
             self.main_model = InferenceClientModel(
-                model_id="meta-llama/Llama-3.1-70B-Instruct",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
                 token=self.hf_token
             )
             
             self.vision_model = InferenceClientModel(
-                model_id="Qwen/Qwen2-VL-72B-Instruct",
+                model_id="Qwen/Qwen2-VL-7B-Instruct",
                 token=self.hf_token
             )
             
             self.code_model = InferenceClientModel(
-                model_id="deepseek-ai/DeepSeek-Coder-V2-Instruct",
+                model_id="bigcode/starcoder2-15b",
                 token=self.hf_token
             )
             
@@ -2161,9 +2161,9 @@ Always verify results after each action.
                 'executed_tests': len(self.execution_results)
             },
             'models': {
-                'orchestration': 'meta-llama/Llama-3.1-70B-Instruct',
-                'vision': 'Qwen/Qwen2-VL-72B-Instruct',
-                'code_generation': 'deepseek-ai/DeepSeek-Coder-V2-Instruct'
+                'orchestration': 'meta-llama/Llama-3.1-8B-Instruct (free tier)',
+                'vision': 'Qwen/Qwen2-VL-7B-Instruct (free tier)',
+                'code_generation': 'bigcode/starcoder2-15b (free tier)'
             },
             'metrics': self.metrics.to_dict(),
             'tools_count': len(self.tools) if hasattr(self, 'tools') else 0,
