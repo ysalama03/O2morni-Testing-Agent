@@ -1,10 +1,10 @@
 """
 Chat Routes
-Handle chat/messaging endpoints
+Handle chat/messaging endpoints for smolagents-based LLM agent
 """
 
 from flask import Blueprint, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def create_chat_routes(llm_agent):
@@ -21,15 +21,32 @@ def create_chat_routes(llm_agent):
             if not message:
                 return jsonify({'error': 'Message is required'}), 400
             
+            # Get full response from agent
             response = llm_agent.process_message(message)
             
+            # Return complete response with all fields expected by frontend
             return jsonify({
-                'message': response['text'],
-                'actions': response['actions'],
-                'timestamp': datetime.utcnow().isoformat()
+                'text': response.get('text', ''),
+                'message': response.get('text', ''),  # Backward compatibility
+                'actions': response.get('actions', []),
+                'code': response.get('code'),
+                'phase': response.get('phase', 'idle'),
+                'metrics': response.get('metrics', {}),
+                'success': response.get('success', True),
+                'test_cases': response.get('test_cases'),
+                'ground_truth': response.get('ground_truth'),
+                'screenshot': response.get('screenshot'),
+                'execution_results': response.get('execution_results'),
+                'generated_tests': response.get('generated_tests'),
+                'timestamp': datetime.now(timezone.utc).isoformat()
             })
         except Exception as e:
-            return jsonify({'error': str(e)}), 500
+            print(f"Error in chat route: {e}")
+            return jsonify({
+                'error': str(e),
+                'success': False,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }), 500
     
     @blueprint.route('/history', methods=['GET'])
     def get_history():
@@ -38,7 +55,44 @@ def create_chat_routes(llm_agent):
             history = llm_agent.get_chat_history()
             return jsonify({
                 'history': history,
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @blueprint.route('/status', methods=['GET'])
+    def get_agent_status():
+        """Get the current status of the LLM agent"""
+        try:
+            status = llm_agent.get_agent_status()
+            return jsonify({
+                'status': status,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @blueprint.route('/initialize', methods=['POST'])
+    def initialize_agent():
+        """Initialize or reinitialize the LLM agent"""
+        try:
+            llm_agent.initialize()
+            return jsonify({
+                'message': 'Agent initialized successfully',
+                'status': llm_agent.get_agent_status(),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @blueprint.route('/clear', methods=['POST'])
+    def clear_history():
+        """Clear chat history"""
+        try:
+            llm_agent.clear_chat_history()
+            return jsonify({
+                'message': 'Chat history cleared',
+                'timestamp': datetime.now(timezone.utc).isoformat()
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500

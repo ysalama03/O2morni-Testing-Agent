@@ -17,6 +17,25 @@ class BrowserController:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self._thread_id = None  # Track which thread owns the browser
+    
+    def is_healthy(self) -> bool:
+        """Check if browser session is healthy and usable"""
+        try:
+            if not self.page or not self.browser:
+                return False
+            # Try a simple operation to check if browser is responsive
+            self.page.url
+            return True
+        except Exception:
+            return False
+    
+    def restart(self):
+        """Restart the browser session"""
+        print('Restarting browser session...')
+        self.close()
+        self.initialize()
+        print('Browser restarted successfully')
         
     def initialize(self):
         """Initialize the browser instance"""
@@ -48,24 +67,38 @@ class BrowserController:
         """Close the browser instance"""
         try:
             if self.page:
-                self.page.close()
+                try:
+                    self.page.close()
+                except:
+                    pass  # Suppress errors if already closed
+                    
             if self.context:
-                self.context.close()
+                try:
+                    self.context.close()
+                except:
+                    pass
+                    
             if self.browser:
-                self.browser.close()
+                try:
+                    self.browser.close()
+                except:
+                    pass
+                    
             if self.playwright:
-                self.playwright.stop()
+                try:
+                    self.playwright.stop()
+                except:
+                    pass
             
             self.page = None
             self.context = None
             self.browser = None
             self.playwright = None
-            print('Browser closed')
-        except Exception as e:
-            print(f'Error closing browser: {e}')
+        except Exception:
+            pass  # Silent cleanup during shutdown
     
     def get_browser_state(self) -> Dict:
-        """Get current browser state including screenshot"""
+        """Get current browser state (WITHOUT screenshot to avoid threading issues from polling)"""
         if not self.page:
             return {
                 'screenshot': None,
@@ -75,28 +108,56 @@ class BrowserController:
             }
         
         try:
-            url = self.page.url
-            screenshot_bytes = self.page.screenshot(full_page=False)
-            screenshot_b64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+            # Try to get current URL - this is usually safe
+            try:
+                url = self.page.url
+            except:
+                url = None
             
+            # Skip screenshot to avoid thread-switching errors during polling
             return {
-                'screenshot': f'data:image/png;base64,{screenshot_b64}',
+                'screenshot': None,
                 'url': url,
                 'loading': False
             }
         except Exception as e:
-            print(f'Error getting browser state: {e}')
+            # Suppress thread-switching errors from polling endpoints
+            if 'cannot switch to a different thread' not in str(e):
+                print(f'Error getting browser state: {e}')
             return {
                 'screenshot': None,
                 'url': None,
-                'loading': False,
-                'error': str(e)
+                'loading': False
             }
+    
+    def capture_screenshot(self, full_page: bool = False) -> Optional[str]:
+        """
+        Capture a screenshot and return as base64 data URL
+        This method is for agent operations only (not for polling endpoints)
+        """
+        if not self.page:
+            return None
+        
+        try:
+            screenshot_bytes = self.page.screenshot(full_page=full_page)
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+            return f'data:image/png;base64,{screenshot_b64}'
+        except Exception as e:
+            print(f'Error capturing screenshot: {e}')
+            return None
     
     def navigate_to(self, url: str) -> Dict:
         """Navigate to a URL"""
-        if not self.page:
-            self.initialize()
+        # Auto-recover if browser is unhealthy
+        if not self.is_healthy():
+            try:
+                self.restart()
+            except Exception as e:
+                return {
+                    'success': False,
+                    'error': f'Browser session crashed and could not restart: {e}',
+                    'needs_restart': True
+                }
         
         try:
             # Add protocol if missing
@@ -105,17 +166,59 @@ class BrowserController:
             
             self.page.goto(url, wait_until='networkidle', timeout=30000)
             
+            # Capture screenshot after successful navigation
+            screenshot = self.capture_screenshot()
+            
             return {
                 'success': True,
                 'url': self.page.url,
-                'title': self.page.title()
+                'title': self.page.title(),
+                'screenshot': screenshot
             }
         except Exception as e:
+            error_str = str(e)
             print(f'Error navigating to {url}: {e}')
-            return {
-                'success': False,
-                'error': str(e)
-            }
+            
+            # Check for specific error types
+            if 'ERR_NAME_NOT_RESOLVED' in error_str:
+                return {
+                    'success': False,
+                    'error': error_str,
+                    'error_type': 'dns_error',
+                    'message': f"Could not find website '{url}'. The URL may be incorrect.",
+                    'suggestions': [
+                        'Check if the URL is spelled correctly',
+                        'Try adding or removing "www."',
+                        'Search on Google to find the correct URL'
+                    ]
+                }
+            elif 'cannot switch to a different thread' in error_str:
+                # Browser session corrupted, restart it
+                try:
+                    self.restart()
+                    return {
+                        'success': False,
+                        'error': 'Browser session was corrupted and has been restarted. Please try again.',
+                        'error_type': 'session_recovered'
+                    }
+                except Exception as restart_error:
+                    return {
+                        'success': False,
+                        'error': f'Browser crashed: {restart_error}',
+                        'error_type': 'crash'
+                    }
+            elif 'Timeout' in error_str:
+                return {
+                    'success': False,
+                    'error': error_str,
+                    'error_type': 'timeout',
+                    'message': f"The website '{url}' took too long to respond."
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': error_str
+                }
     
     def click_element(self, selector: str) -> Dict:
         """Click an element on the page"""

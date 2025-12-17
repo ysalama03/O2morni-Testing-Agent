@@ -2,5 +2,14 @@ Flask==3.0.0
 flask-cors==4.0.0
 playwright==1.40.0
 python-dotenv==1.0.0
-requests==2.31.0
-greenlet>=3.0.0
+requests>=2.32.3
+
+# Smolagents and AI dependencies
+smolagents[toolkit]>=1.0.0
+huggingface_hub>=0.20.0
+Pillow>=10.0.0
+transformers>=4.36.0
+
+# Additional dependencies for agent functionality
+aiohttp>=3.9.0
+httpx>=0.25.0

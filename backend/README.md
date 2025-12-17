@@ -1,6 +1,30 @@
 # Python Backend for Web Testing Agent
 
-This is a Python implementation of the backend server using Flask and Playwright.
+This is a Python implementation of the backend server using Flask, Playwright, and **smolagents** for AI-powered web testing.
+
+## Architecture
+
+The agent uses a **multi-model architecture** with smolagents:
+
+| Model | Purpose | Provider |
+|-------|---------|----------|
+| **Llama-3.1-70B-Instruct** | Main orchestration and reasoning | Meta (via HuggingFace) |
+| **Qwen2-VL-72B-Instruct** | Visual web reasoning with screenshots | Alibaba (via HuggingFace) |
+| **DeepSeek-Coder-V2-Instruct** | Test code generation | DeepSeek (via HuggingFace) |
+
+### Tools Available
+
+The agent has access to these Playwright-based tools:
+- `navigate_to_url` - Navigate to webpages
+- `click_element` - Click on elements using CSS selectors
+- `type_text` - Type text into input fields
+- `get_element_text` - Extract text from elements
+- `wait_for_element` - Wait for elements to appear
+- `evaluate_javascript` - Execute JavaScript on the page
+- `get_browser_state` - Get current page URL and state
+- `scroll_page` - Scroll the page up/down
+- `search_in_page` - Find text on the page
+- `generate_test_code` - Generate Playwright test scripts
 
 ## Setup
 
@@ -25,7 +49,16 @@ pip install -r requirements.txt
 
 4. Install Playwright browsers:
 ```bash
-playwright install chromium
+python -m playwright install chromium
+```
+
+5. Configure environment variables:
+```bash
+# Copy the example env file
+cp .env.example .env
+
+# Edit .env and add your HuggingFace token
+# Get your token from: https://huggingface.co/settings/tokens
 ```
 
 ## Running the Server
@@ -38,6 +71,7 @@ The server will start on port 3001 by default.
 
 ## Environment Variables
 
+- `HF_TOKEN`: HuggingFace API token (required for LLM models)
 - `PORT`: Server port (default: 3001)
 - `FLASK_ENV`: Environment mode (development/production)
 - `HEADLESS`: Run browser in headless mode (default: true)
@@ -47,6 +81,9 @@ The server will start on port 3001 by default.
 ### Chat
 - `POST /api/chat/` - Send a message to the agent
 - `GET /api/chat/history` - Get chat history
+- `GET /api/chat/status` - Get agent status and model info
+- `POST /api/chat/initialize` - Initialize/reinitialize the agent
+- `POST /api/chat/clear` - Clear chat history
 
 ### Browser
 - `GET /api/browser/state` - Get current browser state

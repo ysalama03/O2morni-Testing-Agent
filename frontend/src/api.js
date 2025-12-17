@@ -11,7 +11,7 @@ const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api
  * @returns {Promise<Object>} Response from the agent
  */
 export const sendMessage = async (message) => {
-  const response = await fetch(`${API_BASE_URL}/chat`, {
+  const response = await fetch(`${API_BASE_URL}/chat/`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
