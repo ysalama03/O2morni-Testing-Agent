@@ -50,9 +50,18 @@ def create_metrics_routes():
                 try:
                     agent_metrics = llm_agent_ref.get_metrics()
                     if agent_metrics:
+                        # Update combined metrics with agent metrics (agent metrics are authoritative)
                         combined_metrics.update(agent_metrics)
                 except Exception as e:
                     print(f"Error getting agent metrics: {e}")
+            
+            # Ensure all required fields are present
+            if 'testsRun' not in combined_metrics:
+                combined_metrics['testsRun'] = 0
+            if 'testsPassed' not in combined_metrics:
+                combined_metrics['testsPassed'] = 0
+            if 'testsFailed' not in combined_metrics:
+                combined_metrics['testsFailed'] = 0
             
             return jsonify(combined_metrics)
         except Exception as e:

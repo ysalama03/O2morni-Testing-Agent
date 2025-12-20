@@ -10,6 +10,10 @@ import signal
 import sys
 import logging
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from browser.browser_control import BrowserController
 from agents.llm_agent import LLMAgent
@@ -51,9 +55,9 @@ setup_monitoring(app)
 # Register blueprints
 app.register_blueprint(create_chat_routes(llm_agent))
 app.register_blueprint(create_browser_routes(browser_controller))
-app.register_blueprint(create_test_routes(browser_controller))
+app.register_blueprint(create_test_routes(llm_agent))
 app.register_blueprint(create_metrics_routes())
-app.register_blueprint(create_report_routes())
+app.register_blueprint(create_report_routes(llm_agent))
 
 # Serve static files
 @app.route('/generated-tests/<path:filename>')
@@ -158,4 +162,14 @@ if __name__ == '__main__':
         print('Skipping browser initialization (waiting for reloader)')
     
     # Run Flask app
-    app.run(host='0.0.0.0', port=PORT, debug=os.environ.get('FLASK_ENV') == 'development')
+    # Disable threading and reloader to avoid Playwright cross-thread issues
+    # Playwright's sync API uses greenlets which are thread-local
+    # Flask's reloader runs in a separate thread, causing "cannot switch to a different thread" errors
+    is_debug = os.environ.get('FLASK_ENV') == 'development'
+    app.run(
+        host='0.0.0.0', 
+        port=PORT, 
+        debug=is_debug,
+        use_reloader=False,  # Disable reloader to prevent threading issues with Playwright
+        threaded=False  # Disable threading to fix Playwright cross-thread errors
+    )

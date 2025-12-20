@@ -104,6 +104,11 @@ class MetricsTracker:
     total_tokens_consumed: int = 0
     request_times: List[float] = field(default_factory=list)
     token_counts: List[int] = field(default_factory=list)
+    # Test execution metrics
+    tests_run: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    execution_time: float = 0
     
     @property
     def average_response_time(self) -> float:
@@ -128,13 +133,28 @@ class MetricsTracker:
             self.request_times = self.request_times[-100:]
             self.token_counts = self.token_counts[-100:]
     
+    def record_test_execution(self, tests_run: int, tests_passed: int, tests_failed: int, execution_time_ms: float):
+        """Record test execution metrics"""
+        self.tests_run += tests_run
+        self.tests_passed += tests_passed
+        self.tests_failed += tests_failed
+        self.execution_time = execution_time_ms
+    
     def to_dict(self) -> Dict:
         return {
             'total_requests': self.total_requests,
-            'average_response_time_ms': round(self.average_response_time, 2),
+            'average_response_time': round(self.average_response_time, 2),  # Frontend expects this name
+            'average_response_time_ms': round(self.average_response_time, 2),  # Also include for compatibility
             'total_tokens_consumed': self.total_tokens_consumed,
             'tokens_per_request': round(self.tokens_per_request, 2),
-            'last_response_time_ms': self.request_times[-1] if self.request_times else 0
+            'last_response_time_ms': self.request_times[-1] if self.request_times else 0,
+            'response_times': self.request_times[-10:] if self.request_times else [],  # Last 10 for chart
+            # Test execution metrics (both naming conventions for compatibility)
+            'testsRun': self.tests_run,
+            'testsPassed': self.tests_passed,
+            'testsFailed': self.tests_failed,
+            'executionTime': round(self.execution_time, 2),
+            'coverage': 0  # Placeholder for future implementation
         }
 
 
@@ -166,7 +186,7 @@ class ExplorePageTool(Tool):
 
     def forward(self, url: str) -> Dict:
         # Check if we're already on the correct page (navigation already done by start_exploration)
-        current_url = self.browser_controller.page.url if self.browser_controller.page else None
+        current_url = self.browser_controller.get_current_url()
         
         # Only navigate if we're not already on the page
         if not current_url or not current_url.startswith(url.rstrip('/')):
@@ -289,9 +309,9 @@ class ExplorePageTool(Tool):
         if not dom_result.get('success'):
             return {'success': False, 'error': 'Failed to analyze DOM'}
         
-        # Capture screenshot for exploration phase
-        screenshot = self.browser_controller.capture_screenshot(full_page=False)
-        current_url = self.browser_controller.page.url if self.browser_controller.page else None
+        # Capture screenshot for exploration phase (update latest for real-time frontend updates)
+        screenshot = self.browser_controller.capture_screenshot(full_page=False, update_latest=True)
+        current_url = self.browser_controller.get_current_url()
         
         return {
             'success': True,
@@ -348,8 +368,8 @@ class AnalyzeElementsTool(Tool):
                         locators.css = el.tagName.toLowerCase() + '.' + el.className.split(' ')[0];
                     }}
                     
-                    // Attribute-based
-                    if (el.name) locators.name = `[${{el.tagName.toLowerCase()}}[name="${{el.name}}"]]`;
+                    // Attribute-based (use proper CSS selector format)
+                    if (el.name) locators.name = `[name="${{el.name}}"]`;
                     if (el.getAttribute('data-testid')) {{
                         locators.testid = `[data-testid="${{el.getAttribute('data-testid')}}"]`;
                     }}
@@ -400,7 +420,17 @@ class NavigateTool(Tool):
     description = """
     Navigates the browser to a specified URL.
     Use this tool when you need to visit a webpage.
-    It returns the page title and final URL after navigation.
+    
+    Returns a dictionary with:
+    - 'success': boolean indicating if navigation succeeded
+    - 'url': the final URL after navigation
+    - 'title': the page title (if available)
+    - 'screenshot': base64 screenshot (if available)
+    
+    Example usage:
+    result = navigate_to_url("https://example.com")
+    if result['success']:
+        print(f"Navigated to: {result['url']}")
     """
     inputs = {
         "url": {
@@ -682,6 +712,9 @@ class GenerateTestCodeTool(Tool):
         super().__init__()
         self.code_model = code_model
         self.browser_controller = browser_controller
+        # Store model_id and token for fallback text generation
+        self.model_id = getattr(code_model, 'model_id', None) or "bigcode/starcoder2-15b"
+        self.hf_token = getattr(code_model, 'token', None) or os.environ.get('HF_TOKEN')
 
     def forward(self, test_case: Dict, url: str, element_locators: Dict = None) -> str:
         # Build the prompt with locator strategy guidance
@@ -722,19 +755,141 @@ Requirements:
 
 Generate ONLY the Python code:
 """
-        messages = [{"role": "user", "content": prompt}]
-        response = self.code_model(messages)
+        try:
+            print(f"Calling code model for test case: {test_case.get('name', 'Unknown')}")
+            
+            # Starcoder models use text generation, not chat completion
+            # Use the model's generate method directly with the prompt
+            try:
+                # Try chat completion first (for models that support it)
+                messages = [{"role": "user", "content": prompt}]
+                response = self.code_model(messages)
+                code = response.content if hasattr(response, 'content') else str(response)
+            except (StopIteration, AttributeError, KeyError) as e:
+                # Fallback: Use main model (Llama) for code generation since code model isn't available
+                print(f"Code model not available via Inference API: {e}")
+                print("Falling back to main model (Llama) for code generation...")
+                
+                # Use main model if available
+                if hasattr(self, 'main_model') and self.main_model:
+                    try:
+                        print("Using main model (Llama) for code generation")
+                        response = self.main_model(messages)
+                        code = response.content if hasattr(response, 'content') else str(response)
+                        print("✓ Code generated using main model")
+                    except Exception as e2:
+                        print(f"Main model fallback also failed: {e2}")
+                        # Last resort: Generate a basic template
+                        print("Generating code using template-based approach")
+                        code = self._generate_code_template(test_case, url, element_locators)
+                else:
+                    # Last resort: Generate a basic template
+                    print("Main model not available, generating code using template-based approach")
+                    code = self._generate_code_template(test_case, url, element_locators)
+            
+            # Clean up the response
+            if "```python" in code:
+                code = code.split("```python")[1].split("```")[0]
+            elif "```" in code:
+                code = code.split("```")[1].split("```")[0]
+            
+            code = code.strip()
+            print(f"Successfully generated {len(code)} characters of code")
+            return code
+            
+        except Exception as e:
+            error_str = str(e)
+            print(f"ERROR in GenerateTestCodeTool.forward(): {error_str}")
+            import traceback
+            traceback.print_exc()
+            
+            # Provide helpful error message
+            if 'Bad request' in error_str or '400' in error_str:
+                raise Exception(
+                    f"HuggingFace API Bad Request (400). "
+                    f"This usually means:\n"
+                    f"1. Model access issue - Accept terms at: https://huggingface.co/bigcode/starcoder2-15b\n"
+                    f"2. Token permissions - Ensure HF_TOKEN has 'Write' permission\n"
+                    f"3. Request format issue - The prompt might be too large\n\n"
+                    f"Original error: {error_str}"
+                )
+            elif '403' in error_str or 'Forbidden' in error_str:
+                raise Exception(
+                    f"HuggingFace API Forbidden (403). "
+                    f"Your token doesn't have sufficient permissions.\n"
+                    f"Fix: Create a new token with 'Write' permission at https://huggingface.co/settings/tokens\n\n"
+                    f"Original error: {error_str}"
+                )
+            elif '429' in error_str or 'rate limit' in error_str.lower():
+                raise Exception(
+                    f"HuggingFace API Rate Limit (429). "
+                    f"Please wait a moment and try again.\n\n"
+                    f"Original error: {error_str}"
+                )
+            else:
+                raise Exception(
+                    f"Code generation failed: {error_str}\n\n"
+                    f"Please check:\n"
+                    f"- HuggingFace token and model access\n"
+                    f"- Network connectivity\n"
+                    f"- Model availability (bigcode/starcoder2-15b)\n\n"
+                    f"**Note:** The code generation model may not be available via Inference API.\n"
+                    f"Falling back to main model or template-based generation."
+                )
+    
+    def _generate_code_template(self, test_case: Dict, url: str, element_locators: Dict = None) -> str:
+        """Generate a basic Playwright test code template when models aren't available"""
+        test_name = test_case.get('name', 'Test').replace(' ', '_').replace('-', '_')
+        steps = test_case.get('steps', [])
+        expected_results = test_case.get('expected_results', [])
         
-        # Extract code from response
-        code = response.content if hasattr(response, 'content') else str(response)
+        # Extract locators if available
+        locator_code = ""
+        if element_locators:
+            locator_code = "\n        # Available locators:\n"
+            for key, value in list(element_locators.items())[:5]:  # Limit to first 5
+                if isinstance(value, str):
+                    locator_code += f"        # {key}: {value}\n"
         
-        # Clean up the response
-        if "```python" in code:
-            code = code.split("```python")[1].split("```")[0]
-        elif "```" in code:
-            code = code.split("```")[1].split("```")[0]
+        code = f'''"""
+Test: {test_case.get('name', 'Unnamed Test')}
+Description: {test_case.get('description', '')}
+URL: {url}
+"""
+
+import pytest
+from playwright.async_api import Page, expect
+
+
+@pytest.mark.async_test
+async def test_{test_name.lower()}(page: Page):
+    """{test_case.get('description', 'Test description')}"""
+    # Navigate to the page
+    await page.goto("{url}")
+    await page.wait_for_load_state("networkidle")
+{locator_code}
+    # Test steps
+'''
         
-        return code.strip()
+        # Add steps as comments and basic actions
+        for i, step in enumerate(steps, 1):
+            code += f"    # Step {i}: {step}\n"
+            if 'click' in step.lower():
+                code += "    # await page.click('selector_here')\n"
+            elif 'type' in step.lower() or 'fill' in step.lower() or 'enter' in step.lower():
+                code += "    # await page.fill('selector_here', 'value_here')\n"
+            elif 'navigate' in step.lower() or 'go to' in step.lower():
+                code += f"    # await page.goto('{url}')\n"
+            code += "\n"
+        
+        # Add assertions for expected results
+        code += "    # Assertions\n"
+        for result in expected_results:
+            code += f"    # expect(...).to_be_visible()  # {result}\n"
+        
+        code += "\n    # TODO: Implement actual test steps based on the test case\n"
+        
+        return code
 
 
 class ValidateTestCodeTool(Tool):
@@ -881,7 +1036,7 @@ class ExecuteTestTool(Tool):
                 
                 # Capture screenshot after each step for evidence
                 sleep(0.5)
-                screenshot = self.browser_controller.capture_screenshot(full_page=False)
+                screenshot = self.browser_controller.capture_screenshot(full_page=False, update_latest=True)
                 if screenshot:
                     execution_result['screenshots'].append({
                         'step': i + 1,
@@ -1010,20 +1165,65 @@ class LLMAgent:
         
         try:
             # Initialize models (using free-tier models to avoid payment limits)
-            self.main_model = InferenceClientModel(
-                model_id="meta-llama/Llama-3.1-8B-Instruct",
-                token=self.hf_token
-            )
+            # Try primary models first, fallback to alternatives if needed
+            print("Initializing HuggingFace models...")
             
-            self.vision_model = InferenceClientModel(
-                model_id="Qwen/Qwen2-VL-7B-Instruct",
-                token=self.hf_token
-            )
+            # Main orchestration model - try Llama first, fallback to alternatives
+            try:
+                self.main_model = InferenceClientModel(
+                    model_id="meta-llama/Llama-3.1-8B-Instruct",
+                    token=self.hf_token
+                )
+                print("✓ Main model (Llama-3.1-8B) initialized")
+            except Exception as e:
+                print(f"⚠ Llama model failed: {e}")
+                print("Trying alternative: microsoft/Phi-3-mini-4k-instruct")
+                try:
+                    self.main_model = InferenceClientModel(
+                        model_id="microsoft/Phi-3-mini-4k-instruct",
+                        token=self.hf_token
+                    )
+                    print("✓ Alternative main model (Phi-3) initialized")
+                except Exception as e2:
+                    print(f"⚠ Alternative model also failed: {e2}")
+                    raise Exception(f"Could not initialize main model. Original error: {e}")
             
-            self.code_model = InferenceClientModel(
-                model_id="bigcode/starcoder2-15b",
-                token=self.hf_token
-            )
+            # Vision model
+            try:
+                self.vision_model = InferenceClientModel(
+                    model_id="Qwen/Qwen2-VL-7B-Instruct",
+                    token=self.hf_token
+                )
+                print("✓ Vision model (Qwen2-VL) initialized")
+            except Exception as e:
+                print(f"⚠ Vision model failed: {e}")
+                print("Vision features may be limited")
+                self.vision_model = None  # Make it optional
+            
+            # Code generation model - try Starcoder first, fallback to alternatives
+            self.code_model_id = None  # Track which model ID we're using
+            try:
+                self.code_model_id = "bigcode/starcoder2-15b"
+                self.code_model = InferenceClientModel(
+                    model_id=self.code_model_id,
+                    token=self.hf_token
+                )
+                print("✓ Code model (Starcoder2-15B) initialized")
+            except Exception as e:
+                print(f"⚠ Starcoder model failed: {e}")
+                print("Trying alternative: bigcode/starcoder2-7b")
+                try:
+                    self.code_model_id = "bigcode/starcoder2-7b"
+                    self.code_model = InferenceClientModel(
+                        model_id=self.code_model_id,
+                        token=self.hf_token
+                    )
+                    print("✓ Alternative code model (Starcoder2-7B) initialized")
+                except Exception as e2:
+                    print(f"⚠ Alternative code model also failed: {e2}")
+                    print("Code generation will not be available until model access is granted")
+                    self.code_model = None  # Make it optional for now
+                    self.code_model_id = None
             
             # Create all tools for the workflow
             self.tools = [
@@ -1040,8 +1240,8 @@ class LLMAgent:
                 GetBrowserStateTool(self.browser_controller),
                 ScrollPageTool(self.browser_controller),
                 SearchInPageTool(self.browser_controller),
-                # Phase 3: Code generation
-                GenerateTestCodeTool(self.code_model, self.browser_controller),
+                # Phase 3: Code generation (only if code model is available)
+                *([GenerateTestCodeTool(self.code_model, self.browser_controller)] if self.code_model else []),
                 ValidateTestCodeTool(self.browser_controller),
                 # Phase 4: Verification
                 ExecuteTestTool(self.browser_controller),
@@ -1057,15 +1257,20 @@ class LLMAgent:
                 verbosity_level=1,
             )
             
-            # Create vision agent for visual analysis
-            self.vision_agent = CodeAgent(
-                tools=self.tools,
-                model=self.vision_model,
-                additional_authorized_imports=["playwright", "time", "json", "re"],
-                step_callbacks=[self._save_screenshot_callback],
-                max_steps=15,
-                verbosity_level=1,
-            )
+            # Create vision agent for visual analysis (only if vision model is available)
+            if self.vision_model:
+                self.vision_agent = CodeAgent(
+                    tools=self.tools,
+                    model=self.vision_model,
+                    additional_authorized_imports=["playwright", "time", "json", "re"],
+                    step_callbacks=[self._save_screenshot_callback],
+                    max_steps=15,
+                    verbosity_level=1,
+                )
+                print("✓ Vision agent initialized")
+            else:
+                self.vision_agent = None
+                print("⚠ Vision agent not available (vision model not accessible)")
             
             self.is_initialized = True
             self.current_phase = WorkflowPhase.IDLE
@@ -1088,11 +1293,38 @@ class LLMAgent:
                     if isinstance(previous_step, ActionStep) and previous_step.step_number <= current_step - 2:
                         previous_step.observations_images = None
                 
-                screenshot_bytes = self.browser_controller.page.screenshot(full_page=False)
-                image = Image.open(BytesIO(screenshot_bytes))
-                memory_step.observations_images = [image.copy()]
+                # Use the thread-safe capture_screenshot method
+                # update_latest=True ensures frontend gets real-time updates
+                screenshot_data_url = self.browser_controller.capture_screenshot(full_page=False, update_latest=True)
+                if screenshot_data_url:
+                    try:
+                        # Extract base64 data from data URL
+                        screenshot_b64 = screenshot_data_url.split(',')[1] if ',' in screenshot_data_url else screenshot_data_url
+                        screenshot_bytes = base64.b64decode(screenshot_b64)
+                        image = Image.open(BytesIO(screenshot_bytes))
+                        
+                        # Resize image if too large (HuggingFace has size limits)
+                        # Max dimensions: 2048x2048 for most vision models
+                        max_size = (2048, 2048)
+                        if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
+                            image.thumbnail(max_size, Image.Resampling.LANCZOS)
+                        
+                        # Convert to RGB if necessary (some models require RGB)
+                        if image.mode != 'RGB':
+                            image = image.convert('RGB')
+                        
+                        memory_step.observations_images = [image.copy()]
+                    except Exception as img_error:
+                        print(f"Warning: Failed to process screenshot for step {current_step}: {img_error}")
+                        # Continue without image rather than failing
+                        memory_step.observations_images = None
                 
-                url_info = f"Current URL: {self.browser_controller.page.url}"
+                # Get URL safely (this should also be locked, but for now just try)
+                try:
+                    current_url = self.browser_controller.get_current_url()
+                    url_info = f"Current URL: {current_url if current_url else 'Unknown'}"
+                except:
+                    url_info = "Current URL: Unknown"
                 memory_step.observations = (
                     url_info if memory_step.observations is None 
                     else memory_step.observations + "\n" + url_info
@@ -1234,10 +1466,40 @@ class LLMAgent:
                 }
                 
         except Exception as e:
+            error_str = str(e)
+            print(f"Error in start_exploration: {error_str}")
+            
+            # Check if it's a HuggingFace API error
+            if 'Bad request' in error_str or '400' in error_str:
+                return {
+                    'success': False,
+                    'phase': 'exploration',
+                    'error': error_str,
+                    'message': (
+                        f"⚠️ **HuggingFace API Error (Bad Request - 400)**\n\n"
+                        f"**The model access is still pending approval.**\n\n"
+                        f"**Current Status:**\n"
+                        f"- Your model access requests are being reviewed by HuggingFace\n"
+                        f"- This typically takes 1-3 business days\n"
+                        f"- You'll receive an email when approved\n\n"
+                        f"**What you can do:**\n"
+                        f"1. **Wait for approval** - Check your email for updates from HuggingFace\n"
+                        f"2. **Check status** - Visit the model pages to see if approval is complete:\n"
+                        f"   - https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct\n"
+                        f"   - https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct\n"
+                        f"   - https://huggingface.co/bigcode/starcoder2-15b\n"
+                        f"3. **Try again later** - Once approved, restart the server and try again\n\n"
+                        f"**Note:** The browser automation still works, but AI features require model access.\n\n"
+                        f"**Technical details:** {error_str}"
+                    ),
+                    'metrics': self.metrics.to_dict()
+                }
+            
             return {
                 'success': False,
                 'phase': 'exploration',
-                'error': str(e),
+                'error': error_str,
+                'message': f"❌ **Exploration failed**\n\nError: {error_str}\n\nPlease try again.",
                 'metrics': self.metrics.to_dict()
             }
     
@@ -1286,13 +1548,17 @@ class LLMAgent:
         """
         Phase 2: Propose test cases based on ground truth for human review.
         """
+        print(f"propose_test_cases() called. Ground truth exists: {self.ground_truth is not None}")
         start_time = time()
         self.current_phase = WorkflowPhase.COLLABORATIVE_DESIGN
         
         if not self.ground_truth:
+            print("ERROR: No ground truth available for test case proposal")
             return {
                 'success': False,
+                'message': '⚠️ **No ground truth available.**\n\nPlease run exploration first by providing a URL.\n\nExample: `https://www.google.com/`',
                 'error': 'No ground truth available. Please run exploration first.',
+                'phase': 'collaborative_design',
                 'metrics': self.metrics.to_dict()
             }
         
@@ -1322,9 +1588,13 @@ class LLMAgent:
             }
             
         except Exception as e:
+            error_msg = str(e)
+            print(f"Error in propose_test_cases: {error_msg}")
             return {
                 'success': False,
-                'error': str(e),
+                'message': f'⚠️ **Error proposing test cases:**\n\n{error_msg}\n\nPlease try again or run exploration first.',
+                'error': error_msg,
+                'phase': 'collaborative_design',
                 'metrics': self.metrics.to_dict()
             }
     
@@ -1388,9 +1658,34 @@ class LLMAgent:
                     tc_id += 1
         
         # Generate button interaction tests
-        buttons = [b for b in (self.ground_truth.dom_summary and 
-                   json.loads(self.ground_truth.dom_summary).get('buttons', []) or [])
-                  if b.get('text')][:2]
+        buttons = []
+        if self.ground_truth.dom_summary:
+            try:
+                # dom_summary might be a JSON string or already a dict
+                if isinstance(self.ground_truth.dom_summary, str):
+                    dom_data = json.loads(self.ground_truth.dom_summary)
+                else:
+                    dom_data = self.ground_truth.dom_summary
+                
+                if isinstance(dom_data, dict):
+                    buttons = [b for b in dom_data.get('buttons', []) if b.get('text')][:2]
+            except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                print(f"Warning: Could not parse dom_summary for buttons: {e}")
+                buttons = []
+        
+        # Add button tests
+        for button in buttons:
+            test_cases.append(TestCase(
+                id=f"TC-{tc_id:03d}",
+                name=f"Button Click: {button.get('text', 'Unknown')[:30]}",
+                description=f"Test button click interaction",
+                preconditions=[f"Navigate to {self.ground_truth.url}"],
+                steps=[f"Click on '{button.get('text', 'button')}' button", "Wait for response"],
+                expected_results=["Button responds correctly", "Expected action occurs"],
+                priority="medium",
+                status="proposed"
+            ))
+            tc_id += 1
         
         return test_cases[:8]  # Limit to 8 test cases initially
     
@@ -1426,10 +1721,13 @@ class LLMAgent:
         response_messages = []
         
         if 'approve all' in feedback_lower:
+            # Clear and repopulate approved_test_cases
+            self.approved_test_cases = []
             for tc in self.proposed_test_cases:
                 tc.status = 'approved'
-            self.approved_test_cases = self.proposed_test_cases.copy()
+                self.approved_test_cases.append(tc)  # Add each test case individually
             response_messages.append(f"✅ All {len(self.approved_test_cases)} test cases approved!")
+            print(f"Approved {len(self.approved_test_cases)} test cases: {[tc.id for tc in self.approved_test_cases]}")
             
         else:
             # Parse individual approvals/rejections/revisions
@@ -1487,8 +1785,33 @@ class LLMAgent:
         """
         Phase 3: Generate test code for approved test cases.
         """
+        print(f"generate_test_code() called. Approved test cases: {len(self.approved_test_cases)}")
         start_time = time()
         self.current_phase = WorkflowPhase.IMPLEMENTATION
+        
+        # Check if code model is initialized
+        if not self.code_model:
+            error_msg = "Code generation model not initialized. Please check your HF_TOKEN and model access."
+            print(f"ERROR: {error_msg}")
+            return {
+                'success': False,
+                'message': f'⚠️ **{error_msg}**',
+                'error': error_msg,
+                'phase': 'implementation',
+                'metrics': self.metrics.to_dict()
+            }
+        
+        # Check if ground truth exists
+        if not self.ground_truth:
+            error_msg = "No ground truth available. Please run exploration first."
+            print(f"ERROR: {error_msg}")
+            return {
+                'success': False,
+                'message': f'⚠️ **{error_msg}**',
+                'error': error_msg,
+                'phase': 'implementation',
+                'metrics': self.metrics.to_dict()
+            }
         
         # Get test cases to implement
         if test_case_id:
@@ -1497,11 +1820,17 @@ class LLMAgent:
             test_cases = self.approved_test_cases
         
         if not test_cases:
+            error_msg = 'No approved test cases to implement. Please approve test cases first.'
+            print(f"ERROR: {error_msg}")
             return {
                 'success': False,
-                'error': 'No approved test cases to implement. Please approve test cases first.',
+                'message': f'⚠️ **{error_msg}**',
+                'error': error_msg,
+                'phase': 'implementation',
                 'metrics': self.metrics.to_dict()
             }
+        
+        print(f"Generating code for {len(test_cases)} test case(s)")
         
         generated_tests = []
         
@@ -1511,7 +1840,14 @@ class LLMAgent:
                 locators = self._extract_locators_for_test(tc)
                 
                 # Generate code
+                # Pass main model as fallback if code model fails
                 code_tool = GenerateTestCodeTool(self.code_model, self.browser_controller)
+                # Pass model_id and main model for fallback
+                if hasattr(self, 'code_model_id') and self.code_model_id:
+                    code_tool.model_id = self.code_model_id
+                    code_tool.hf_token = self.hf_token
+                # Pass main model as fallback for code generation (since code model isn't available via Inference API)
+                code_tool.main_model = self.main_model
                 code = code_tool.forward(
                     test_case=self._test_case_to_dict(tc),
                     url=self.ground_truth.url if self.ground_truth else "",
@@ -1533,10 +1869,14 @@ class LLMAgent:
                 })
                 
             except Exception as e:
+                error_msg = str(e)
+                print(f"ERROR generating code for {tc.id}: {error_msg}")
+                import traceback
+                traceback.print_exc()
                 generated_tests.append({
                     'id': tc.id,
                     'name': tc.name,
-                    'error': str(e)
+                    'error': error_msg
                 })
         
         response_time = (time() - start_time) * 1000
@@ -1553,7 +1893,20 @@ class LLMAgent:
                     f"```python\n{test['code']}\n```\n"
                 )
             else:
-                code_blocks.append(f"### {test['id']}: {test['name']}\n**Error:** {test.get('error', 'Unknown')}\n")
+                error_detail = test.get('error', 'Unknown error occurred')
+                if not error_detail or error_detail == 'Unknown error occurred':
+                    error_detail = (
+                        "Code generation failed. This is usually due to:\n"
+                        "1. HuggingFace API error (Bad Request/Forbidden)\n"
+                        "2. Model access not granted (accept terms at https://huggingface.co/bigcode/starcoder2-15b)\n"
+                        "3. Token permissions (needs 'Write' permission)\n"
+                        "4. Network connectivity issues\n\n"
+                        "Check the terminal/console for detailed error messages."
+                    )
+                code_blocks.append(
+                    f"### {test['id']}: {test['name']}\n"
+                    f"**❌ Error:**\n\n{error_detail}\n"
+                )
         
         return {
             'success': True,
@@ -1655,6 +2008,12 @@ class LLMAgent:
         passed = sum(1 for r in execution_results if r.get('status') == 'passed')
         failed = len(execution_results) - passed
         
+        # Update test execution metrics in the tracker
+        self.metrics.record_test_execution(len(execution_results), passed, failed, response_time)
+        
+        # Get updated metrics
+        metrics_dict = self.metrics.to_dict()
+        
         return {
             'success': True,
             'phase': 'verification',
@@ -1672,7 +2031,7 @@ class LLMAgent:
                       f"- 'refactor TC-001: fix the login selector' to request code changes\n"
                       f"- 'rerun TC-001' to re-execute a specific test\n"
                       f"- 'export tests' to save the test files",
-            'metrics': self.metrics.to_dict()
+            'metrics': metrics_dict
         }
     
     def refactor_test(self, test_case_id: str, feedback: str) -> Dict:
@@ -1702,17 +2061,76 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
 """
         
         messages = [{"role": "user", "content": prompt}]
-        response = self.code_model(messages)
         
-        new_code = response.content if hasattr(response, 'content') else str(response)
-        
-        # Clean up
-        if "```python" in new_code:
-            new_code = new_code.split("```python")[1].split("```")[0]
-        elif "```" in new_code:
-            new_code = new_code.split("```")[1].split("```")[0]
-        
-        self.generated_code[test_case_id] = new_code.strip()
+        try:
+            # Try using code model first
+            if self.code_model:
+                try:
+                    response = self.code_model(messages)
+                    new_code = response.content if hasattr(response, 'content') else str(response)
+                except (StopIteration, AttributeError, KeyError) as e:
+                    # Fallback to main model if code model fails
+                    print(f"Code model not available for refactoring: {e}")
+                    if self.main_model:
+                        print("Falling back to main model for refactoring")
+                        response = self.main_model(messages)
+                        new_code = response.content if hasattr(response, 'content') else str(response)
+                    else:
+                        raise Exception("No models available for refactoring. Please check your HuggingFace token and model access.")
+            elif self.main_model:
+                # Use main model if code model not available
+                response = self.main_model(messages)
+                new_code = response.content if hasattr(response, 'content') else str(response)
+            else:
+                raise Exception("No models available for refactoring. Please check your HuggingFace token and model access.")
+            
+            # Clean up
+            if "```python" in new_code:
+                new_code = new_code.split("```python")[1].split("```")[0]
+            elif "```" in new_code:
+                new_code = new_code.split("```")[1].split("```")[0]
+            
+            self.generated_code[test_case_id] = new_code.strip()
+            
+        except Exception as e:
+            error_str = str(e) or "Unknown error occurred during refactoring"
+            print(f"ERROR in refactor_test(): {error_str}")
+            import traceback
+            traceback.print_exc()
+            
+            # Provide helpful error message
+            if 'Bad request' in error_str or '400' in error_str:
+                error_msg = (
+                    f"HuggingFace API Bad Request (400) during refactoring.\n\n"
+                    f"This usually means:\n"
+                    f"1. Model access issue - Accept terms at: https://huggingface.co/bigcode/starcoder2-15b\n"
+                    f"2. Token permissions - Ensure HF_TOKEN has 'Write' permission\n"
+                    f"3. Request format issue - The prompt might be too large\n\n"
+                    f"Original error: {error_str}"
+                )
+            elif '403' in error_str or 'Forbidden' in error_str:
+                error_msg = (
+                    f"HuggingFace API Forbidden (403) during refactoring.\n"
+                    f"Your token doesn't have sufficient permissions.\n"
+                    f"Fix: Create a new token with 'Write' permission at https://huggingface.co/settings/tokens\n\n"
+                    f"Original error: {error_str}"
+                )
+            else:
+                error_msg = (
+                    f"Refactoring failed: {error_str}\n\n"
+                    f"Please check:\n"
+                    f"- HuggingFace token and model access\n"
+                    f"- Network connectivity\n"
+                    f"- Model availability"
+                )
+            
+            return {
+                'success': False,
+                'error': error_msg,
+                'message': f'⚠️ **Refactoring failed:**\n\n{error_msg}',
+                'phase': 'verification',
+                'metrics': self.metrics.to_dict()
+            }
         
         response_time = (time() - start_time) * 1000
         self.metrics.record_request(response_time, tokens=1500)
@@ -1778,12 +2196,18 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
             # Route based on message intent and current phase
             result = self._route_message(message, lower_message)
             
-            response['text'] = result.get('message', result.get('text', ''))
+            # Handle both 'message' and 'error' fields in response
+            response['text'] = result.get('message', result.get('text', result.get('error', '')))
             response['phase'] = result.get('phase', self.current_phase.value)
             response['code'] = result.get('code') or result.get('refactored_code')
             response['success'] = result.get('success', True)
             response['actions'] = result.get('actions', [])
             response['metrics'] = result.get('metrics', self.metrics.to_dict())
+            
+            # If there's an error, make sure it's displayed
+            if result.get('error') and not result.get('message'):
+                response['text'] = f"⚠️ {result.get('error')}"
+                response['success'] = False
             
             # Add additional data if present
             if result.get('ground_truth'):
@@ -1814,11 +2238,16 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
         """Route message to appropriate handler based on intent"""
         
         # Phase 1: Exploration - detect URL input
+        # Match URLs more leniently - if message is mostly just a URL, go to exploration
         url_match = re.search(r'https?://[^\s<>"{}|\\^`\[\]]+', message)
-        if url_match and ('test' in lower_message or 'explore' in lower_message or 
-                          'analyze' in lower_message or self.current_phase == WorkflowPhase.IDLE):
+        if url_match:
             url = url_match.group()
-            result = self.start_exploration(url)
+            # If message is mostly just the URL (with maybe some whitespace), go to exploration
+            message_without_url = message.replace(url, '').strip()
+            is_url_only = len(message_without_url) < 20  # Allow some extra text like "test this" or "explore"
+            
+            if is_url_only or 'test' in lower_message or 'explore' in lower_message or 'analyze' in lower_message or self.current_phase == WorkflowPhase.IDLE:
+                result = self.start_exploration(url)
             
             # Automatically propose test cases after exploration
             if result.get('success'):
@@ -1838,7 +2267,12 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
             return self.handle_test_case_feedback(message)
         
         # Phase 2: Request test case proposals
-        if any(keyword in lower_message for keyword in ['propose test', 'suggest test', 'what tests', 'test cases']):
+        # Match variations: "propose test cases", "propose tests", "suggest test cases", etc.
+        if any(keyword in lower_message for keyword in [
+            'propose test', 'suggest test', 'what tests', 'test cases', 
+            'propose tests', 'show test', 'list test', 'create test'
+        ]):
+            print(f"Matched test case proposal request: '{message}'")
             return self.propose_test_cases()
         
         # Phase 3: Implementation - generate code
@@ -1954,24 +2388,67 @@ Example: `Test https://example.com/login`
             return {
                 'success': False,
                 'error': 'No tests to export. Generate test code first.',
+                'message': '⚠️ **No tests to export. Generate test code first.**',
                 'metrics': self.metrics.to_dict()
             }
         
+        # Get base directory and create tests directory
+        import os
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        TESTS_DIR = os.path.join(BASE_DIR, 'generated_tests')
+        os.makedirs(TESTS_DIR, exist_ok=True)
+        
         exported = []
+        saved_files = []
+        
         for test_id, code in self.generated_code.items():
             filename = f"test_{test_id.lower().replace('-', '_')}.py"
-            exported.append({
-                'filename': filename,
-                'code': code
-            })
+            file_path = os.path.join(TESTS_DIR, filename)
+            
+            try:
+                # Save the file
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(code)
+                
+                exported.append({
+                    'filename': filename,
+                    'code': code,
+                    'test_id': test_id
+                })
+                saved_files.append({
+                    'filename': filename,
+                    'path': file_path,
+                    'test_id': test_id
+                })
+                print(f"✓ Saved test file: {file_path}")
+            except Exception as e:
+                print(f"✗ Error saving test file {filename}: {e}")
+                exported.append({
+                    'filename': filename,
+                    'code': code,
+                    'test_id': test_id,
+                    'error': str(e)
+                })
+        
+        if not saved_files:
+            return {
+                'success': False,
+                'error': 'Failed to save any test files. Check file permissions.',
+                'message': '⚠️ **Failed to save test files. Check file permissions.**',
+                'metrics': self.metrics.to_dict()
+            }
+        
+        files_list = '\n'.join(f"- `{f['filename']}` → `{f['path']}`" for f in saved_files)
         
         return {
             'success': True,
             'phase': 'verification',
             'exported_tests': exported,
-            'message': f"## 📁 Exported {len(exported)} Test Files\n\n" +
-                      '\n'.join(f"- `{t['filename']}`" for t in exported) +
-                      "\n\nTests are ready to be saved to the `generated_tests/` directory.",
+            'saved_files': saved_files,
+            'message': f"## ✅ Exported {len(saved_files)} Test File(s)\n\n" +
+                      f"Files saved to `generated_tests/` directory:\n\n" +
+                      files_list +
+                      f"\n\n**Total:** {len(saved_files)} file(s) saved successfully.",
             'metrics': self.metrics.to_dict()
         }
     
@@ -1989,10 +2466,57 @@ Example: `Test https://example.com/login`
                 'metrics': self.metrics.to_dict()
             }
         except Exception as e:
+            error_str = str(e)
+            error_msg = f"Error: {error_str}"
+            
+            # Handle HuggingFace API errors specifically
+            if 'Bad request' in error_str or '400' in error_str:
+                error_msg = (
+                    f"⚠️ **HuggingFace API Error (Bad Request - 400)**\n\n"
+                    f"This error typically occurs when:\n"
+                    f"1. **Model Terms Not Accepted** - You haven't accepted the terms of use for one or more models\n"
+                    f"2. **Token Permissions** - Your token doesn't have 'Write' permission\n"
+                    f"3. **Model Access** - The model may not be accessible with your current token\n"
+                    f"4. **Request Payload** - The request might be too large or malformed\n\n"
+                    f"**🔧 IMMEDIATE FIX REQUIRED:**\n\n"
+                    f"**Step 1: Accept Model Terms**\n"
+                    f"Visit these pages and click 'Agree and access repository' for EACH model:\n"
+                    f"  ✅ https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct\n"
+                    f"  ✅ https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct (most common cause)\n"
+                    f"  ✅ https://huggingface.co/bigcode/starcoder2-15b\n\n"
+                    f"**Step 2: Verify Token Permissions**\n"
+                    f"1. Go to https://huggingface.co/settings/tokens\n"
+                    f"2. Check your token has **'Write'** permission (not 'Read')\n"
+                    f"3. If not, create a new token with 'Write' permission\n"
+                    f"4. Update `backend/.env` with: `HF_TOKEN=your_new_token`\n"
+                    f"5. Restart the server\n\n"
+                    f"**Step 3: Retry**\n"
+                    f"After completing steps 1-2, try your request again.\n\n"
+                    f"**Technical details:** {error_str}"
+                )
+            elif '403' in error_str or 'Forbidden' in error_str:
+                error_msg = (
+                    f"🔒 **HuggingFace API Error (Forbidden)**\n\n"
+                    f"Your token doesn't have sufficient permissions.\n\n"
+                    f"**Fix:**\n"
+                    f"1. Go to https://huggingface.co/settings/tokens\n"
+                    f"2. Create a NEW token with **'Write'** permission (not 'Read')\n"
+                    f"3. Update your `backend/.env` file with the new token\n"
+                    f"4. Restart the server\n\n"
+                    f"**Technical details:** {error_str}"
+                )
+            elif '429' in error_str or 'rate limit' in error_str.lower():
+                error_msg = (
+                    f"⏱️ **HuggingFace API Rate Limit**\n\n"
+                    f"You've hit the rate limit. Please wait a moment and try again.\n\n"
+                    f"**Technical details:** {error_str}"
+                )
+            
             return {
                 'success': False,
                 'phase': self.current_phase.value,
-                'message': f"Error: {str(e)}",
+                'message': error_msg,
+                'error': error_str,
                 'metrics': self.metrics.to_dict()
             }
     
@@ -2000,19 +2524,43 @@ Example: `Test https://example.com/login`
         """Get instructions for the agent on tool usage"""
         return """
 
-Browser Automation Instructions:
-- Use explore_page for deep page analysis (Phase 1)
-- Use analyze_elements to find best selectors for specific elements
-- Use navigate_to_url to visit webpages
-- Use click_element with CSS selectors like '#id', '.class', '[data-testid="name"]'
-- Use type_text to fill input fields
-- Use wait_for_element before interacting with dynamic content
-- Use generate_test_code to create Playwright tests (Phase 3)
-- Use validate_test_code to verify selectors exist
-- Use execute_test to run and verify tests (Phase 4)
-- Use generate_report to create execution reports
+Browser Automation Instructions - AVAILABLE TOOLS ONLY:
 
-Always verify results after each action.
+IMPORTANT: Only use these exact tool names (they are case-sensitive):
+- navigate_to_url(url) - Returns a DICT with 'success', 'url', 'title', 'screenshot'. Access with: result['url'], not result.url
+- explore_page(url) - Analyzes page structure (Phase 1)
+- analyze_elements(element_description) - Finds selectors for elements
+- click_element(selector) - Clicks an element using CSS selector
+- type_text(selector, text) - Types text into an input field
+- get_element_text(selector) - Gets text from an element
+- wait_for_element(selector, timeout) - Waits for element to appear
+- evaluate_javascript(script) - Executes JavaScript
+- get_browser_state() - Gets current browser state
+- scroll_page(pixels) - Scrolls the page
+- search_in_page(text) - Searches for text on page
+- generate_test_code(...) - Generates test code (Phase 3)
+- validate_test_code(code) - Validates test code
+- execute_test(...) - Executes tests (Phase 4)
+- generate_report(...) - Generates reports
+
+CSS SELECTOR FORMAT:
+- CORRECT: '#id', '.class', '[name="value"]', 'input[name="q"]'
+- WRONG: '[input[name="q"]]' (invalid - has extra brackets)
+- DO NOT use: 'visit_webpage', 'web_search' (these tools don't exist)
+
+CODE GENERATION RULES:
+- Generate ONLY valid Python code
+- DO NOT include HTML/XML tags like </, <>, etc.
+- DO NOT include markdown code blocks in tool calls
+- Use proper Python syntax only
+- Example: result = explore_page("https://example.com")  # CORRECT
+- Example: result = explore_page("https://example.com") </  # WRONG - no closing tags
+
+RETURN VALUES:
+- navigate_to_url() returns a DICT, not an object. Access with: result['url'], result['title']
+- All tools return dictionaries with 'success' key
+
+Always check the 'success' key in return values before proceeding.
 """
     
     def _extract_actions(self, message: str) -> List[str]:
@@ -2065,11 +2613,11 @@ Always verify results after each action.
             
             # Press Enter to search
             if self.browser_controller.page:
-                self.browser_controller.page.keyboard.press('Enter')
+                self.browser_controller.press_key('Enter')
                 sleep(2)  # Wait for results
             
-            # Capture screenshot of search results
-            screenshot = self.browser_controller.capture_screenshot()
+            # Capture screenshot of search results (update latest for real-time frontend updates)
+            screenshot = self.browser_controller.capture_screenshot(update_latest=True)
             
             # Try to extract search result links
             results_script = """

@@ -57,3 +57,4 @@ reports/*.jpg
 tmp/
 temp/
 *.tmp
+venv/

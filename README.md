@@ -7,6 +7,7 @@ A comprehensive web-based testing solution that combines LLM-powered test genera
 ## 🎯 Overview
 
 This project provides a complete testing agent system with:
+
 - **Frontend**: React-based UI for interactive testing
 - **Backend**: Express server with LLM agent integration
 - **Browser Control**: Playwright-powered browser automation
@@ -63,24 +64,27 @@ web-testing-agent/
 
 ### Prerequisites
 
-- Node.js 16+ 
+- Node.js 16+
 - npm or yarn
 
 ### Installation
 
 1. **Clone the repository**
+
    ```bash
    git clone <repository-url>
    cd Web-based-Testing-Agent
    ```
 
 2. **Install backend dependencies**
+
    ```bash
    cd backend
    npm install
    ```
 
 3. **Install frontend dependencies**
+
    ```bash
    cd ../frontend
    npm install
@@ -95,17 +99,21 @@ web-testing-agent/
 ### Running the Application
 
 1. **Start the backend server**
+
    ```bash
    cd backend
    npm start
    ```
+
    The backend will run on `http://localhost:3001`
 
 2. **Start the frontend development server**
+
    ```bash
    cd frontend
    npm start
    ```
+
    The frontend will run on `http://localhost:3000`
 
 3. **Access the application**
@@ -132,20 +140,24 @@ web-testing-agent/
 ## 📡 API Endpoints
 
 ### Chat
+
 - `POST /api/chat` - Send message to LLM agent
 - `GET /api/chat/history` - Get chat history
 
 ### Browser
+
 - `GET /api/browser/state` - Get current browser state with screenshot
 - `POST /api/browser/navigate` - Navigate to URL
 - `POST /api/browser/action` - Perform browser action (click, type, etc.)
 
 ### Tests
+
 - `GET /api/tests` - List generated tests
 - `POST /api/tests/generate` - Generate new test
 - `POST /api/tests/execute` - Execute test
 
 ### Metrics & Reports
+
 - `GET /api/metrics` - Get current metrics
 - `GET /api/reports` - List test reports
 - `GET /api/reports/:id` - Get specific report
@@ -155,6 +167,7 @@ web-testing-agent/
 ### Environment Variables
 
 **Backend** (create `backend/.env`):
+
 ```env
 PORT=3001
 NODE_ENV=development
@@ -162,6 +175,7 @@ HEADLESS=false
 ```
 
 **Frontend** (create `frontend/.env`):
+
 ```env
 REACT_APP_API_URL=http://localhost:3001/api
 ```
@@ -169,6 +183,7 @@ REACT_APP_API_URL=http://localhost:3001/api
 ## 🧪 Usage Examples
 
 ### Generate a Test
+
 ```javascript
 // POST /api/tests/generate
 {
@@ -188,6 +203,7 @@ REACT_APP_API_URL=http://localhost:3001/api
 ```
 
 ### Execute a Test
+
 ```javascript
 // POST /api/tests/execute
 {
@@ -199,12 +215,14 @@ REACT_APP_API_URL=http://localhost:3001/api
 ## 🛠️ Development
 
 ### Project Goals
+
 - Provide a human-in-the-loop testing assistant
 - Enable rapid test creation and execution
 - Offer real-time visibility into test execution
 - Support iterative test improvement
 
 ### Technology Stack
+
 - **Frontend**: React, vanilla CSS
 - **Backend**: Node.js, Express
 - **Browser Automation**: Playwright

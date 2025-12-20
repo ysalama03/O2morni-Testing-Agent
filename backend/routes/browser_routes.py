@@ -15,7 +15,10 @@ def create_browser_routes(browser_controller):
     def get_state():
         """Get current browser state"""
         try:
-            state = browser_controller.get_browser_state()
+            # Check if screenshot is requested via query parameter
+            include_screenshot = request.args.get('screenshot', 'false').lower() == 'true'
+            
+            state = browser_controller.get_browser_state(include_screenshot=include_screenshot)
             return jsonify(state)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
