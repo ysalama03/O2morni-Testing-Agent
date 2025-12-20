@@ -23,18 +23,31 @@ const Dashboard = () => {
     // Poll for updates periodically
     const interval = setInterval(async () => {
       try {
+        // Always request screenshots to get real-time updates during agent execution
+        // The backend caches the latest screenshot, so this is efficient
         const [browserData, metricsData] = await Promise.all([
-          getBrowserState(),
+          getBrowserState(true),  // Always request screenshot for real-time updates
           getMetrics()
         ]);
-        setBrowserState(browserData);
+        
+        // Update browser state with latest screenshot (backend returns cached latest)
+        setBrowserState(prev => ({
+          ...prev,
+          ...browserData,
+          // Update screenshot if provided (backend returns latest cached screenshot)
+          screenshot: browserData.screenshot || prev.screenshot,
+          // Always update URL and loading state
+          url: browserData.url || prev.url,
+          loading: browserData.loading || false
+        }));
+        
         if (metricsData) {
           setMetrics(prev => ({ ...prev, ...metricsData }));
         }
       } catch (error) {
         console.error('Error fetching updates:', error);
       }
-    }, 2000);
+    }, 1500);  // Poll every 1.5 seconds for more responsive real-time updates
 
     return () => clearInterval(interval);
   }, []);

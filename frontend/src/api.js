@@ -28,10 +28,12 @@ export const sendMessage = async (message) => {
 
 /**
  * Get current browser state including screenshot
+ * @param {boolean} includeScreenshot - Whether to include screenshot in response
  * @returns {Promise<Object>} Browser state data
  */
-export const getBrowserState = async () => {
-  const response = await fetch(`${API_BASE_URL}/browser/state`);
+export const getBrowserState = async (includeScreenshot = false) => {
+  const url = `${API_BASE_URL}/browser/state${includeScreenshot ? '?screenshot=true' : ''}`;
+  const response = await fetch(url);
 
   if (!response.ok) {
     throw new Error(`API error: ${response.statusText}`);
@@ -101,7 +103,26 @@ export const executeTests = async (testConfig) => {
  * @returns {Promise<Array>} List of test files
  */
 export const getGeneratedTests = async () => {
-  const response = await fetch(`${API_BASE_URL}/tests`);
+  const response = await fetch(`${API_BASE_URL}/tests/list`);
+
+  if (!response.ok) {
+    throw new Error(`API error: ${response.statusText}`);
+  }
+
+  return response.json();
+};
+
+/**
+ * Export generated tests to files
+ * @returns {Promise<Object>} Export result with saved files
+ */
+export const exportTests = async () => {
+  const response = await fetch(`${API_BASE_URL}/tests/export`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
 
   if (!response.ok) {
     throw new Error(`API error: ${response.statusText}`);
