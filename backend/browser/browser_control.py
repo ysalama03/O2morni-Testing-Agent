@@ -24,6 +24,8 @@ class BrowserController:
         self._initialized_thread = None  # Track which thread initialized the browser
         self._latest_screenshot = None  # Store latest screenshot for real-time frontend updates
         self._latest_screenshot_timestamp = None  # Track when screenshot was taken
+        self._video_path = None  # Track video recording path
+        self._video_context = None  # Separate context for video recording
     
     def is_healthy(self) -> bool:
         """Check if browser session is healthy and usable"""
@@ -76,6 +78,8 @@ class BrowserController:
             )
             
             self.page = self.context.new_page()
+            self._video_context = None  # Will be created when video recording starts
+            self._video_path = None
             print(f'Browser initialized successfully in thread {self._initialized_thread}')
         except Exception as e:
             print(f'Failed to initialize browser: {e}')
@@ -374,3 +378,104 @@ class BrowserController:
             except Exception as e:
                 print(f'Error pressing key {key}: {e}')
                 return {'success': False, 'error': str(e)}
+    
+    def start_video_recording(self, video_path: str) -> Dict:
+        """Start video recording for test execution"""
+        with self._lock:
+            try:
+                if not self.browser:
+                    return {'success': False, 'error': 'Browser not initialized'}
+                
+                # Create a new context with video recording enabled
+                video_dir = os.path.dirname(video_path)
+                os.makedirs(video_dir, exist_ok=True)
+                
+                # Playwright requires record_video_dir (directory) not a specific file path
+                # It will generate a filename automatically
+                self._video_context = self.browser.new_context(
+                    viewport={'width': 1280, 'height': 720},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    record_video_dir=video_dir,
+                    record_video_size={'width': 1280, 'height': 720}
+                )
+                
+                # Create a new page in the video context
+                video_page = self._video_context.new_page()
+                
+                # Copy current page state to video page
+                if self.page:
+                    try:
+                        current_url = self.page.url
+                        if current_url and current_url != 'about:blank':
+                            video_page.goto(current_url, wait_until='networkidle', timeout=30000)
+                    except:
+                        pass  # Don't fail if navigation fails
+                
+                self._video_path = video_path
+                return {
+                    'success': True,
+                    'video_path': video_path,
+                    'video_page': video_page
+                }
+            except Exception as e:
+                print(f"Error starting video recording: {e}")
+                import traceback
+                traceback.print_exc()
+                return {'success': False, 'error': str(e)}
+    
+    def stop_video_recording(self) -> Optional[str]:
+        """Stop video recording and return the video file path"""
+        with self._lock:
+            try:
+                if self._video_context:
+                    # Get the video path before closing (Playwright stores it in page.video)
+                    video_file = None
+                    try:
+                        # Try to get video from the page
+                        pages = self._video_context.pages
+                        if pages:
+                            page_video = pages[0].video
+                            if page_video:
+                                video_file = page_video.path()
+                    except:
+                        pass
+                    
+                    # Close video context to finalize video
+                    self._video_context.close()
+                    
+                    # Playwright saves video with a generated name, we need to find and rename it
+                    import glob
+                    if self._video_path:
+                        video_dir = os.path.dirname(self._video_path)
+                        # Find the most recent video file in the directory
+                        video_files = glob.glob(os.path.join(video_dir, '*.webm'))
+                        if video_files:
+                            # Get the most recent video file
+                            latest_video = max(video_files, key=os.path.getctime)
+                            # Use the video file path from page if available, otherwise use latest
+                            source_video = video_file if video_file and os.path.exists(video_file) else latest_video
+                            
+                            # Rename it to our desired name
+                            if source_video != self._video_path:
+                                try:
+                                    if os.path.exists(self._video_path):
+                                        os.remove(self._video_path)  # Remove old file if exists
+                                    os.rename(source_video, self._video_path)
+                                except Exception as rename_error:
+                                    print(f"Could not rename video file: {rename_error}")
+                                    # Return the generated name if rename fails
+                                    return source_video
+                            
+                            final_path = self._video_path if os.path.exists(self._video_path) else source_video
+                            self._video_context = None
+                            self._video_path = None
+                            return final_path
+                    
+                    self._video_context = None
+                    self._video_path = None
+                return None
+            except Exception as e:
+                print(f"Error stopping video recording: {e}")
+                import traceback
+                traceback.print_exc()
+                return None

@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import ChatPanel from './ChatPanel';
 import BrowserView from './BrowserView';
 import MetricsPanel from './MetricsPanel';
-import { sendMessage, getBrowserState, getMetrics } from '../api';
+import { sendMessage, getBrowserState, getMetrics, getExecutionProgress, resetAgent } from '../api';
 
 /**
  * Dashboard Component
@@ -18,6 +18,7 @@ const Dashboard = () => {
   const [metrics, setMetrics] = useState({});
   const [workflowPhase, setWorkflowPhase] = useState('idle');
   const [isLoading, setIsLoading] = useState(false);
+  const [executionProgress, setExecutionProgress] = useState(null);
 
   useEffect(() => {
     // Poll for updates periodically
@@ -25,9 +26,10 @@ const Dashboard = () => {
       try {
         // Always request screenshots to get real-time updates during agent execution
         // The backend caches the latest screenshot, so this is efficient
-        const [browserData, metricsData] = await Promise.all([
+        const [browserData, metricsData, progressData] = await Promise.all([
           getBrowserState(true),  // Always request screenshot for real-time updates
-          getMetrics()
+          getMetrics(),
+          getExecutionProgress().catch(() => ({ progress: null }))  // Get execution progress
         ]);
         
         // Update browser state with latest screenshot (backend returns cached latest)
@@ -44,13 +46,53 @@ const Dashboard = () => {
         if (metricsData) {
           setMetrics(prev => ({ ...prev, ...metricsData }));
         }
+        
+        // Update execution progress if available
+        if (progressData && progressData.progress) {
+          setExecutionProgress(progressData.progress);
+        } else if (progressData && !progressData.progress) {
+          // Clear progress if execution is complete
+          setExecutionProgress(null);
+        }
       } catch (error) {
         console.error('Error fetching updates:', error);
       }
-    }, 1500);  // Poll every 1.5 seconds for more responsive real-time updates
+    }, 1000);  // Poll every 1 second for more responsive real-time updates during test execution
 
     return () => clearInterval(interval);
   }, []);
+
+  const handleReset = async () => {
+    if (window.confirm('Are you sure you want to reset the agent? This will clear all test data and allow you to start testing a new website.')) {
+      try {
+        const response = await resetAgent();
+        setMessages([]);
+        setWorkflowPhase('idle');
+        setBrowserState({
+          screenshot: null,
+          url: null,
+          loading: false
+        });
+        
+        // Add reset confirmation message
+        const resetMessage = {
+          role: 'agent',
+          content: response.text || response.message || 'Agent reset successfully. Send a URL to start testing a new website.',
+          timestamp: new Date().toISOString(),
+          phase: 'idle'
+        };
+        setMessages([resetMessage]);
+      } catch (error) {
+        console.error('Error resetting agent:', error);
+        const errorMessage = {
+          role: 'system',
+          content: `Error: ${error.message || 'Failed to reset agent'}`,
+          timestamp: new Date().toISOString()
+        };
+        setMessages(prev => [...prev, errorMessage]);
+      }
+    }
+  };
 
   const handleSendMessage = async (content) => {
     const timestamp = new Date().toISOString();
@@ -136,6 +178,7 @@ const Dashboard = () => {
             onSendMessage={handleSendMessage}
             workflowPhase={workflowPhase}
             isLoading={isLoading}
+            onReset={handleReset}
           />
         </div>
         <div className="dashboard-center">
@@ -144,6 +187,7 @@ const Dashboard = () => {
             url={browserState.url}
             loading={browserState.loading}
             metrics={metrics}
+            executionProgress={executionProgress}
           />
         </div>
         <div className="dashboard-right">

@@ -985,9 +985,11 @@ class ExecuteTestTool(Tool):
     }
     output_type = "object"
 
-    def __init__(self, browser_controller):
+    def __init__(self, browser_controller, progress_callback=None, video_page=None):
         super().__init__()
         self.browser_controller = browser_controller
+        self.progress_callback = progress_callback
+        self.video_page = video_page  # Separate page for video recording
 
     def forward(self, test_steps: List[str], test_name: str) -> Dict:
         execution_result = {
@@ -1016,6 +1018,12 @@ class ExecuteTestTool(Tool):
                     if url_match:
                         result = self.browser_controller.navigate_to(url_match.group())
                         step_result['status'] = 'passed' if result.get('success') else 'failed'
+                        # Also navigate video page if recording
+                        if self.video_page and result.get('success'):
+                            try:
+                                self.video_page.goto(url_match.group(), wait_until='networkidle', timeout=30000)
+                            except:
+                                pass  # Don't fail test if video page navigation fails
                         
                 elif 'click' in step_lower:
                     # Extract selector from step
@@ -1023,6 +1031,12 @@ class ExecuteTestTool(Tool):
                     if selector_match:
                         result = self.browser_controller.click_element(selector_match.group(1))
                         step_result['status'] = 'passed' if result.get('success') else 'failed'
+                        # Also click on video page if recording
+                        if self.video_page and result.get('success'):
+                            try:
+                                self.video_page.click(selector_match.group(1), timeout=5000)
+                            except:
+                                pass  # Don't fail test if video page click fails
                         
                 elif 'type' in step_lower or 'enter' in step_lower or 'fill' in step_lower:
                     # This would need more sophisticated parsing
@@ -1042,6 +1056,15 @@ class ExecuteTestTool(Tool):
                         'step': i + 1,
                         'screenshot': screenshot
                     })
+                
+                # Update progress for real-time frontend updates
+                if self.progress_callback:
+                    self.progress_callback(
+                        step_number=i + 1,
+                        step_description=step,
+                        status=step_result['status'],
+                        screenshot=screenshot
+                    )
                 
             except Exception as e:
                 step_result['status'] = 'error'
@@ -1151,6 +1174,9 @@ class LLMAgent:
         
         # Metrics tracking
         self.metrics = MetricsTracker()
+        
+        # Test execution progress tracking for real-time updates
+        self.current_execution_progress: Optional[Dict] = None
         
         # HuggingFace API token
         self.hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
@@ -1953,16 +1979,42 @@ class LLMAgent:
         start_time = time()
         self.current_phase = WorkflowPhase.VERIFICATION
         
-        # Get tests to execute
-        if test_case_id:
-            tests_to_run = {k: v for k, v in self.generated_code.items() if k == test_case_id}
-        else:
+        # If no test_case_id specified, prompt user to choose
+        if not test_case_id:
+            available_tests = list(self.generated_code.keys())
+            if not available_tests:
+                return {
+                    'success': False,
+                    'error': 'No generated tests to execute. Please generate test code first.',
+                    'message': '⚠️ **No generated tests to execute.**\n\nPlease generate test code first using "Generate code".',
+                    'metrics': self.metrics.to_dict()
+                }
+            
+            # Format available test cases
+            test_list = '\n'.join([f"- `{tc_id}`" for tc_id in available_tests])
+            return {
+                'success': False,
+                'error': 'Please specify which test case to run.',
+                'message': f"## 🧪 Which Test Case to Run?\n\n"
+                          f"Available test cases:\n{test_list}\n\n"
+                          f"**Please specify:**\n"
+                          f"- `run tests TC-001` to run a specific test\n"
+                          f"- `run all tests` to run all tests",
+                'available_tests': available_tests,
+                'metrics': self.metrics.to_dict()
+            }
+        
+        # Get tests to execute (if test_case_id is 'all', run all; otherwise run specific test)
+        if test_case_id == 'all':
             tests_to_run = self.generated_code
+        else:
+            tests_to_run = {k: v for k, v in self.generated_code.items() if k == test_case_id}
         
         if not tests_to_run:
             return {
                 'success': False,
-                'error': 'No generated tests to execute. Please generate test code first.',
+                'error': f'Test case {test_case_id} not found in generated code.',
+                'message': f'⚠️ **Test case {test_case_id} not found.**\n\nAvailable test cases: {", ".join(self.generated_code.keys())}',
                 'metrics': self.metrics.to_dict()
             }
         
@@ -1973,12 +2025,44 @@ class LLMAgent:
             if not test_case:
                 continue
             
-            # Execute the test steps
-            execute_tool = ExecuteTestTool(self.browser_controller)
+            # Initialize progress tracking
+            self.current_execution_progress = {
+                'test_id': test_id,
+                'test_name': test_case.name,
+                'status': 'running',
+                'current_step': 0,
+                'total_steps': len(test_case.steps),
+                'steps': [],
+                'start_time': datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Start video recording for this test
+            import os
+            BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            REPORTS_DIR = os.path.join(BASE_DIR, 'reports')
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            video_dir = os.path.join(REPORTS_DIR, f"videos_{timestamp}")
+            os.makedirs(video_dir, exist_ok=True)
+            video_path = os.path.join(video_dir, f"{test_id}_test_execution.webm")
+            
+            video_result = self.browser_controller.start_video_recording(video_path)
+            video_page = video_result.get('video_page') if video_result.get('success') else None
+            
+            # Execute the test steps with progress updates
+            execute_tool = ExecuteTestTool(self.browser_controller, progress_callback=self._update_execution_progress, video_page=video_page)
             result = execute_tool.forward(
                 test_steps=test_case.steps,
                 test_name=f"{test_id}: {test_case.name}"
             )
+            
+            # Stop video recording
+            final_video_path = self.browser_controller.stop_video_recording()
+            if final_video_path:
+                result['video_path'] = final_video_path
+            
+            # Mark as complete
+            self.current_execution_progress['status'] = result.get('status', 'completed')
+            self.current_execution_progress['end_time'] = datetime.now(timezone.utc).isoformat()
             
             execution_results.append(result)
             self.execution_results.append(TestExecutionResult(
@@ -1987,7 +2071,8 @@ class LLMAgent:
                 duration_ms=(time() - start_time) * 1000,
                 steps_executed=result.get('steps', []),
                 screenshots=[s.get('screenshot') for s in result.get('screenshots', [])],
-                error_message='; '.join(e.get('error', '') for e in result.get('errors', []))
+                error_message='; '.join(e.get('error', '') for e in result.get('errors', [])),
+                video_path=final_video_path
             ))
         
         # Generate report
@@ -2014,6 +2099,127 @@ class LLMAgent:
         # Get updated metrics
         metrics_dict = self.metrics.to_dict()
         
+        # Save execution report automatically
+        import os
+        import json
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        REPORTS_DIR = os.path.join(BASE_DIR, 'reports')
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        report_filename = f"test_execution_report_{timestamp}.json"
+        report_path = os.path.join(REPORTS_DIR, report_filename)
+        
+        # Create screenshots directory for this report
+        screenshots_dir = os.path.join(REPORTS_DIR, f"screenshots_{timestamp}")
+        os.makedirs(screenshots_dir, exist_ok=True)
+        
+        # Collect video paths from execution results
+        video_paths = []
+        for result in execution_results:
+            if result.get('video_path'):
+                video_paths.append({
+                    'test_name': result.get('test_name', 'Unknown'),
+                    'video_path': result.get('video_path'),
+                    'relative_path': os.path.relpath(result.get('video_path'), REPORTS_DIR) if result.get('video_path') else None
+                })
+        
+        # Save screenshots as separate image files and update references
+        saved_screenshots = []
+        screenshot_index = 0
+        
+        for result in execution_results:
+            test_screenshots = []
+            for screenshot_data in result.get('screenshots', []):
+                screenshot_index += 1
+                if screenshot_data.get('screenshot'):
+                    # Extract base64 data
+                    screenshot_b64 = screenshot_data.get('screenshot')
+                    if screenshot_b64.startswith('data:image'):
+                        # Remove data URL prefix
+                        screenshot_b64 = screenshot_b64.split(',')[1] if ',' in screenshot_b64 else screenshot_b64
+                    
+                    # Save as PNG file
+                    screenshot_filename = f"screenshot_{screenshot_index:03d}_step_{screenshot_data.get('step', screenshot_index)}.png"
+                    screenshot_filepath = os.path.join(screenshots_dir, screenshot_filename)
+                    
+                    try:
+                        screenshot_bytes = base64.b64decode(screenshot_b64)
+                        with open(screenshot_filepath, 'wb') as f:
+                            f.write(screenshot_bytes)
+                        
+                        # Store relative path in report
+                        relative_path = f"screenshots_{timestamp}/{screenshot_filename}"
+                        test_screenshots.append({
+                            'step': screenshot_data.get('step', screenshot_index),
+                            'file': relative_path,
+                            'path': os.path.abspath(screenshot_filepath)
+                        })
+                    except Exception as e:
+                        print(f"Error saving screenshot {screenshot_index}: {e}")
+                        # Keep original if saving fails
+                        test_screenshots.append(screenshot_data)
+            
+            # Update execution result with file paths instead of base64
+            if test_screenshots:
+                result['screenshots'] = test_screenshots
+                saved_screenshots.extend(test_screenshots)
+        
+        # Save report as JSON (without base64 screenshots)
+        report_data = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'summary': {
+                'total': len(execution_results),
+                'passed': passed,
+                'failed': failed
+            },
+            'execution_results': execution_results,
+            'screenshots_directory': f"screenshots_{timestamp}",
+            'screenshots_count': len(saved_screenshots),
+            'videos': video_paths,
+            'videos_count': len(video_paths),
+            'metrics': metrics_dict
+        }
+        
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(report_data, f, indent=2, ensure_ascii=False)
+            report_saved = True
+            reports_path = os.path.abspath(REPORTS_DIR)
+        except Exception as e:
+            print(f"Error saving report: {e}")
+            report_saved = False
+            reports_path = os.path.abspath(REPORTS_DIR)
+        
+        # Clear progress after completion (with a small delay to show final state)
+        sleep(0.5)
+        self.current_execution_progress = None
+        
+        report_info = ""
+        if report_saved:
+            screenshots_info = ""
+            if saved_screenshots:
+                screenshots_info = f"\n**📸 Screenshots:**\n"
+                screenshots_info += f"{len(saved_screenshots)} screenshots saved to:\n"
+                screenshots_info += f"`{os.path.abspath(screenshots_dir)}`\n"
+                screenshots_info += f"Screenshots are saved as PNG files, one per test step.\n"
+            
+            videos_info = ""
+            if video_paths:
+                videos_info = f"\n**🎥 Videos:**\n"
+                videos_info += f"{len(video_paths)} test execution video(s) saved:\n"
+                for video in video_paths:
+                    videos_info += f"- `{video.get('relative_path', video.get('video_path', 'Unknown'))}` ({video.get('test_name', 'Unknown')})\n"
+                videos_info += f"Videos are saved as WebM files in the reports directory.\n"
+            
+            report_info = f"\n\n**📁 Report Saved:**\n"
+            report_info += f"Execution report saved to:\n"
+            report_info += f"`{report_path}`\n\n"
+            report_info += f"All reports are stored in: `{reports_path}`\n"
+            report_info += f"Reports are saved as JSON files with timestamps."
+            report_info += screenshots_info
+            report_info += videos_info
+        
         return {
             'success': True,
             'phase': 'verification',
@@ -2030,8 +2236,11 @@ class LLMAgent:
                       f"\n\n**Review the results above.** If there are issues, you can:\n"
                       f"- 'refactor TC-001: fix the login selector' to request code changes\n"
                       f"- 'rerun TC-001' to re-execute a specific test\n"
-                      f"- 'export tests' to save the test files",
-            'metrics': metrics_dict
+                      f"- 'export tests' to save the test files" +
+                      report_info,
+            'metrics': metrics_dict,
+            'reports_directory': reports_path,
+            'report_path': report_path if report_saved else None
         }
     
     def refactor_test(self, test_case_id: str, feedback: str) -> Dict:
@@ -2220,6 +2429,10 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
                 response['execution_results'] = result['execution_results']
             if result.get('generated_tests'):
                 response['generated_tests'] = result['generated_tests']
+            if result.get('refactored_code'):
+                response['code'] = result['refactored_code']
+            if result.get('code'):
+                response['code'] = result['code']
                 
         except Exception as e:
             print(f"Error processing message: {e}")
@@ -2280,8 +2493,19 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
             return self.generate_test_code()
         
         # Phase 4: Verification - execute tests
-        if any(keyword in lower_message for keyword in ['run test', 'execute test', 'verify', 'run all']):
-            return self.execute_tests()
+        if any(keyword in lower_message for keyword in ['run test', 'execute test', 'verify', 'run all', 'run tests']):
+            # Check if "all" is mentioned
+            if 'all' in lower_message:
+                # Run all tests
+                return self.execute_tests(test_case_id='all')
+            # Check if specific test case mentioned
+            tc_match = re.search(r'tc-?(\d+)', lower_message, re.IGNORECASE)
+            if tc_match:
+                test_id = f"TC-{tc_match.group(1).zfill(3)}"
+                return self.execute_tests(test_id)
+            else:
+                # No specific test mentioned, prompt user
+                return self.execute_tests(test_case_id=None)
         
         # Phase 4: Refactoring
         if 'refactor' in lower_message:
@@ -2297,6 +2521,20 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
             if tc_match:
                 test_id = f"TC-{tc_match.group(1).zfill(3)}"
                 return self.execute_tests(test_id)
+        
+        # Load edited test code from file
+        if 'load test' in lower_message or 'reload test' in lower_message:
+            tc_match = re.search(r'tc-?(\d+)', lower_message, re.IGNORECASE)
+            if tc_match:
+                test_id = f"TC-{tc_match.group(1).zfill(3)}"
+                return self._load_test_from_file(test_id)
+            else:
+                return {
+                    'success': False,
+                    'error': 'Please specify which test case to load.',
+                    'message': '⚠️ **Please specify test case:**\n\nExample: `load test TC-001`',
+                    'metrics': self.metrics.to_dict()
+                }
         
         # Export tests
         if 'export' in lower_message:
@@ -2685,6 +2923,37 @@ Always check the 'success' key in return values before proceeding.
         """Get chat history"""
         return self.chat_history
     
+    def reset_agent(self) -> Dict:
+        """Reset the agent to initial state - clears all workflow data"""
+        try:
+            # Clear all workflow state
+            self.ground_truth = None
+            self.proposed_test_cases = []
+            self.approved_test_cases = []
+            self.generated_code = {}
+            self.execution_results = []
+            self.current_execution_progress = None
+            self.current_phase = WorkflowPhase.IDLE
+            
+            # Clear chat history
+            self.chat_history = []
+            
+            # Reset metrics (optional - you might want to keep metrics)
+            # self.metrics = MetricsTracker()
+            
+            return {
+                'success': True,
+                'message': '✅ **Agent Reset Complete**\n\nAll workflow data has been cleared. You can now start testing a new website by sending a URL.',
+                'phase': 'idle',
+                'metrics': self.metrics.to_dict()
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'message': f'⚠️ Error resetting agent: {str(e)}'
+            }
+    
     def clear_chat_history(self):
         """Clear chat history and reset workflow state"""
         self.chat_history.clear()
@@ -2721,3 +2990,63 @@ Always check the 'success' key in return values before proceeding.
     def get_metrics(self) -> Dict:
         """Get current metrics for real-time display"""
         return self.metrics.to_dict()
+    
+    def get_execution_progress(self) -> Optional[Dict]:
+        """Get current test execution progress for real-time updates"""
+        return self.current_execution_progress
+    
+    def _update_execution_progress(self, step_number: int, step_description: str, status: str, screenshot: str = None):
+        """Update execution progress for real-time frontend updates"""
+        if self.current_execution_progress:
+            self.current_execution_progress['current_step'] = step_number
+            self.current_execution_progress['steps'].append({
+                'step_number': step_number,
+                'description': step_description,
+                'status': status,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'screenshot': screenshot
+            })
+    
+    def _load_test_from_file(self, test_case_id: str) -> Dict:
+        """Load test code from a file (for edited tests)"""
+        import os
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        TESTS_DIR = os.path.join(BASE_DIR, 'generated_tests')
+        filename = f"test_{test_case_id.lower().replace('-', '_')}.py"
+        file_path = os.path.join(TESTS_DIR, filename)
+        
+        if not os.path.exists(file_path):
+            return {
+                'success': False,
+                'error': f'Test file not found: {filename}',
+                'message': f'⚠️ **Test file not found:** `{filename}`\n\n'
+                          f'Make sure you have exported the test first, then edit it in the `generated_tests/` directory.',
+                'metrics': self.metrics.to_dict()
+            }
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                code = f.read()
+            
+            # Update the generated code with the edited version
+            self.generated_code[test_case_id] = code
+            
+            return {
+                'success': True,
+                'message': f'✅ **Test code loaded from file**\n\n'
+                          f'Loaded `{filename}` and updated test code for {test_case_id}.\n\n'
+                          f'You can now:\n'
+                          f'- Say "run tests {test_case_id}" to test the edited code\n'
+                          f'- Say "refactor {test_case_id}: your feedback" to further refine it',
+                'code': code,
+                'test_case_id': test_case_id,
+                'file_path': file_path,
+                'metrics': self.metrics.to_dict()
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f'Error loading test file: {str(e)}',
+                'message': f'⚠️ **Error loading test file:** {str(e)}',
+                'metrics': self.metrics.to_dict()
+            }

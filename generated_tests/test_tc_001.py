@@ -1,57 +1,61 @@
 import pytest
 from playwright.async_api import async_playwright
 
-@pytest.mark.asyncio
-async def test_valid_form_submission(async_playwright):
-    """
-    Test successful form submission with valid data.
+def test_valid_form_submission(async_playwright):
+    # Initialize the browser and context
+    browser = yield async_playwright().start()
+    context = yield browser.new_context()
+    page = yield context.new_page()
 
-    Steps:
-    1. Fill csrfmiddlewaretoken with valid data
-    2. Fill  with valid data
-    3. Click submit button
-    4. Wait for response
+    # Visit the application URL
+    yield page.goto("https://automaonexercise.com/")
 
-    Expected Results:
-    - Form submits successfully
-    - Success message displayed or redirect occurs
-    """
-    browser = await async_playwright().start()
-    context = await browser.new_context()
-    page = await context.new_page()
+    # Wait for the form to be fully loaded and visible
+    yield page.wait_for_selector("#login-form")
 
-    # Step 1: Navigate to the URL
-    await page.goto("https://automationexercise.com/")
+    # Step 1: Fill csrfmiddlewaretoken with valid data
+    yield page.fill('[name="csrf_token"]', "token_value")  # Replace with actual token value
 
-    # Step 2: Wait for the form to load
-    await page.wait_for_selector("#header_section")
+    # Step 2: Fill  with valid data
+    yield page.fill('[name="email"]', "hamada@example.com")
+    yield page.fill('[name="password"]', "password")
 
-    # Step 3: Fill in the form data
-    await page.fill("[data-testid='csrfmiddlewaretoken']", "test")
-    await page.fill("[name='email']", "test@example.com")
-    await page.fill("[name='password']", "password")
+    # Take a screenshot before submitting the form
+    yield page.screenshot(path="form_before_submission.png")
 
-    # Step 4: Take a screenshot before submitting
-    await page.screenshot(path="screenshot_before_submit.png")
+    # Step 3: Click submit button
+    submit_button = yield page.query_selector('[name="Submit"]')
+    yield submit_button.click()
 
-    # Step 5: Click the submit button
-    await page.click("[role='button'][name='Submit']")
+    # Step 4: Wait for response
+    # Wait for the success message or redirect
+    try:
+        # Try to wait for the success message
+        yield page.wait_for_selector("#success")
 
-    # Step 6: Wait for the response
-    await page.wait_for_selector("#result")
+        # Verify that the success message is displayed
+        success_message = yield page.query_selector("#success")
+        assert success_message.is_visible()
+        yield page.screenshot(path="success_message.png")
 
-    # Step 7: Take a screenshot after submitting
-    await page.screenshot(path="screenshot_after_submit.png")
+    except Exception as e:
+        # If the success message is not found, try to wait for the redirect
+        print(f"Exception caught: {e}")
+        try:
+            # Wait for the redirect
+            yield page.wait_for_navigation()
 
-    # Step 8: Verify the success message
-    await page.wait_for_function("return document.querySelector('#result').innerHTML.includes('Success:')")
+            # Verify that the user is redirected to the expected page
+            assert page.url == "https://automationexercise.com/success"
 
-    # Assert that the form submitted successfully
-    assert await page.query_selector("#result") is not None, "Form submission failed"
+            # Take a screenshot after the redirect
+            yield page.screenshot(path="redirected_page.png")
 
-    # Assert that the success message is displayed
-    success_message = await page.query_selector("body > div > div > div > div > div > div > div > div > h2")
-    assert success_message is not None, "Success message not displayed"
+        except Exception as e:
+            # If the redirect is not found, fail the test
+            print(f"Exception caught during redirect: {e}")
+            assert False
 
-    # Clean up
-    await browser.close()
+    finally:
+        # Close the browser resources
+        yield browser.close()

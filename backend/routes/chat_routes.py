@@ -72,6 +72,18 @@ def create_chat_routes(llm_agent):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
     
+    @blueprint.route('/execution-progress', methods=['GET'])
+    def get_execution_progress():
+        """Get current test execution progress for real-time updates"""
+        try:
+            progress = llm_agent.get_execution_progress()
+            return jsonify({
+                'progress': progress,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
     @blueprint.route('/initialize', methods=['POST'])
     def initialize_agent():
         """Initialize or reinitialize the LLM agent"""
@@ -96,5 +108,25 @@ def create_chat_routes(llm_agent):
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+    
+    @blueprint.route('/reset', methods=['POST'])
+    def reset_agent():
+        """Reset the agent to initial state"""
+        try:
+            result = llm_agent.reset_agent()
+            return jsonify({
+                'text': result.get('message', 'Agent reset successfully'),
+                'message': result.get('message', 'Agent reset successfully'),
+                'phase': result.get('phase', 'idle'),
+                'success': result.get('success', True),
+                'metrics': result.get('metrics', {}),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as e:
+            return jsonify({
+                'error': str(e),
+                'success': False,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }), 500
     
     return blueprint

@@ -144,3 +144,36 @@ export const getReports = async () => {
 
   return response.json();
 };
+
+/**
+ * Get current test execution progress
+ * @returns {Promise<Object>} Execution progress data
+ */
+export const getExecutionProgress = async () => {
+  const response = await fetch(`${API_BASE_URL}/chat/execution-progress`);
+
+  if (!response.ok) {
+    throw new Error(`API error: ${response.statusText}`);
+  }
+
+  return response.json();
+};
+
+/**
+ * Reset the agent to initial state
+ * @returns {Promise<Object>} Reset result
+ */
+export const resetAgent = async () => {
+  const response = await fetch(`${API_BASE_URL}/chat/reset`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`API error: ${response.statusText}`);
+  }
+
+  return response.json();
+};

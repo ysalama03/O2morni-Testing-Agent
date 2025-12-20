@@ -5,7 +5,7 @@ import React, { useState, useRef, useEffect } from 'react';
  * Provides an interactive chat interface for the 4-phase testing workflow
  * Displays workflow phase and supports markdown rendering
  */
-const ChatPanel = ({ onSendMessage, messages = [], workflowPhase = 'idle', isLoading = false }) => {
+const ChatPanel = ({ onSendMessage, messages = [], workflowPhase = 'idle', isLoading = false, onReset }) => {
   const [input, setInput] = useState('');
   const messagesEndRef = useRef(null);
 
@@ -87,6 +87,16 @@ const ChatPanel = ({ onSendMessage, messages = [], workflowPhase = 'idle', isLoa
       {/* Header with phase indicator */}
       <div className="chat-header">
         <h2>🤖 O2morni Testing Agent</h2>
+        {onReset && (
+          <button 
+            className="reset-btn"
+            onClick={onReset}
+            disabled={isLoading}
+            title="Reset agent to start testing a new website"
+          >
+            🔄 Reset
+          </button>
+        )}
       </div>
 
       {/* Phase hint */}
