@@ -2,14 +2,15 @@
 Flask Backend Server for Web Testing Agent
 Implements REST API endpoints with Playwright integration and 4-phase workflow
 """
-
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import os
 import signal
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, UTC
 
 from browser.browser_control import BrowserController
 from agents.llm_agent import LLMAgent
@@ -20,17 +21,23 @@ from routes.test_routes import create_test_routes
 from routes.metrics_routes import create_metrics_routes, set_llm_agent
 from routes.report_routes import create_report_routes
 
+# Fix for Playwright in some environments
+#os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0" 
+
 app = Flask(__name__)
-CORS(app)
 
-# Suppress Werkzeug logging for polling endpoints
-import logging
+# GLOBAL CORS: Handles OPTIONS requests automatically for all routes
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# GLOBAL URL SETTING: Handles trailing slashes (e.g., /api/chat vs /api/chat/)
+app.url_map.strict_slashes = False
+
+# Suppress Werkzeug logging for polling endpoints to keep console clean
 werkzeug_logger = logging.getLogger('werkzeug')
-
 class IgnorePollingFilter(logging.Filter):
     def filter(self, record):
-        # Suppress logs for polling endpoints
-        return '/api/metrics/' not in record.getMessage() and '/api/browser/state' not in record.getMessage()
+        msg = record.getMessage()
+        return '/api/metrics' not in msg and '/api/browser/state' not in msg
 
 werkzeug_logger.addFilter(IgnorePollingFilter())
 
@@ -74,7 +81,7 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(UTC).isoformat(),
         'agent_initialized': llm_agent.is_initialized if llm_agent else False
     })
 
@@ -92,12 +99,13 @@ def agent_status():
 # Error handling
 @app.errorhandler(Exception)
 def handle_error(error):
-    """Global error handler"""
+    """Global error handler that won't crash on 404s"""
     app.logger.error(f'Error: {str(error)}')
+    status_code = getattr(error, 'code', 500)
     return jsonify({
         'error': str(error),
-        'timestamp': datetime.utcnow().isoformat()
-    }), getattr(error, 'status_code', 500)
+        'timestamp': datetime.now(UTC).isoformat()
+    }), status_code
 
 # Graceful shutdown handler
 _shutdown_in_progress = False
@@ -105,16 +113,11 @@ _shutdown_in_progress = False
 def shutdown_handler(signum, frame):
     """Handle shutdown signals gracefully"""
     global _shutdown_in_progress
-    
     if _shutdown_in_progress:
-        return  # Prevent multiple shutdown attempts
+        return 
     
     _shutdown_in_progress = True
     print('\n🛑 Shutting down gracefully...')
-    
-    # Suppress asyncio and playwright errors during shutdown
-    logging.getLogger('asyncio').setLevel(logging.CRITICAL)
-    logging.getLogger('playwright').setLevel(logging.CRITICAL)
     
     try:
         browser_controller.close()
@@ -125,37 +128,23 @@ def shutdown_handler(signum, frame):
     print('👋 Goodbye!\n')
     sys.exit(0)
 
-# Register signal handlers
 signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == '__main__':
     print(f'Starting server on port {PORT}')
-    print(f'Environment: {os.environ.get("FLASK_ENV", "production")}')
     
-    # In production mode (no reloader), initialize browser immediately
-    # In debug mode, only initialize in the reloader child process (WERKZEUG_RUN_MAIN='true')
     is_debug = os.environ.get('FLASK_ENV') == 'development'
+    # Only init browser in the main process (not the reloader)
     should_init = not is_debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
     
     if should_init:
-        # Initialize browser on startup
         try:
             browser_controller.initialize()
-            print('Browser initialized successfully')
-            
-            # Initialize LLM agent with browser controller
-            try:
-                llm_agent.initialize(browser_controller)
-                print('LLM Agent initialized with smolagents')
-            except Exception as e:
-                print(f'LLM Agent initialization deferred: {e}')
-                print('Agent will initialize on first request (requires HF_TOKEN env variable)')
-                
+            llm_agent.initialize(browser_controller)
+            print('🚀 System Ready: Browser and Agent initialized.')
         except Exception as e:
-            print(f'Failed to initialize browser: {e}')
-    else:
-        print('Skipping browser initialization (waiting for reloader)')
+            print(f'⚠️ Startup Initialization Failed: {e}')
     
-    # Run Flask app
-    app.run(host='0.0.0.0', port=PORT, debug=os.environ.get('FLASK_ENV') == 'development')
+    # CRITICAL: threaded=False and processes=1 ensures Playwright stays on one thread
+    app.run(host='0.0.0.0', port=PORT, debug=is_debug, threaded=False, processes=1)

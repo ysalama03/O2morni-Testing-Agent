@@ -4,8 +4,30 @@ Handle chat/messaging endpoints for smolagents-based LLM agent
 """
 
 from flask import Blueprint, request, jsonify
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
+def truncate_screenshot(data):
+    """
+    Returns a copy of the dictionary with the 'screenshot' field truncated 
+    to prevent terminal log pollution.
+    """
+    if not isinstance(data, dict):
+        return data
+        
+    # Create a shallow copy so we don't modify the original response
+    clean_data = data.copy()
+    
+    if 'screenshot' in clean_data and isinstance(clean_data['screenshot'], str):
+        s = clean_data['screenshot']
+        # Show only first 30 and last 10 characters
+        clean_data['screenshot'] = f"{s[:30]}...[truncated {len(s)} chars]...{s[-10:]}"
+        
+    # Also handle nested ground_truth if necessary
+    if 'ground_truth' in clean_data and isinstance(clean_data['ground_truth'], dict):
+        if 'screenshot' in clean_data['ground_truth']:
+            clean_data['ground_truth']['screenshot'] = "[truncated]"
+            
+    return clean_data
 
 def create_chat_routes(llm_agent):
     """Create chat routes blueprint"""
@@ -16,10 +38,10 @@ def create_chat_routes(llm_agent):
         """Send a message to the LLM agent and receive a response"""
         try:
             data = request.get_json()
-            message = data.get('message')
-            
-            if not message:
+            if not data or 'message' not in data:
                 return jsonify({'error': 'Message is required'}), 400
+            
+            message = data.get('message')
             
             # Get full response from agent
             response = llm_agent.process_message(message)
@@ -38,14 +60,14 @@ def create_chat_routes(llm_agent):
                 'screenshot': response.get('screenshot'),
                 'execution_results': response.get('execution_results'),
                 'generated_tests': response.get('generated_tests'),
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             })
         except Exception as e:
             print(f"Error in chat route: {e}")
             return jsonify({
                 'error': str(e),
                 'success': False,
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             }), 500
     
     @blueprint.route('/history', methods=['GET'])
@@ -55,7 +77,7 @@ def create_chat_routes(llm_agent):
             history = llm_agent.get_chat_history()
             return jsonify({
                 'history': history,
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -67,7 +89,7 @@ def create_chat_routes(llm_agent):
             status = llm_agent.get_agent_status()
             return jsonify({
                 'status': status,
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -76,11 +98,12 @@ def create_chat_routes(llm_agent):
     def initialize_agent():
         """Initialize or reinitialize the LLM agent"""
         try:
+            # Note: browser_controller is already linked during app startup
             llm_agent.initialize()
             return jsonify({
                 'message': 'Agent initialized successfully',
                 'status': llm_agent.get_agent_status(),
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -92,7 +115,7 @@ def create_chat_routes(llm_agent):
             llm_agent.clear_chat_history()
             return jsonify({
                 'message': 'Chat history cleared',
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500

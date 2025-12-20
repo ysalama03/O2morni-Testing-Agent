@@ -26,8 +26,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from PIL import Image
 
-from smolagents import CodeAgent, Tool, tool, InferenceClientModel
+from smolagents import CodeAgent, Tool, tool, InferenceClientModel, LiteLLMModel
 from smolagents.agents import ActionStep
+
+from routes.chat_routes import truncate_screenshot
 
 
 # ============================================================================
@@ -129,9 +131,11 @@ class MetricsTracker:
             self.token_counts = self.token_counts[-100:]
     
     def to_dict(self) -> Dict:
+        avg_ms = 0 if self.total_response_time_ms == 0 else self.total_response_time_ms / self.total_requests
         return {
             'total_requests': self.total_requests,
-            'average_response_time_ms': round(self.average_response_time, 2),
+            'average_response_time_ms': round(avg_ms, 2),
+            "average_response_time": round(avg_ms / 1000, 2),
             'total_tokens_consumed': self.total_tokens_consumed,
             'tokens_per_request': round(self.tokens_per_request, 2),
             'last_response_time_ms': self.request_times[-1] if self.request_times else 0
@@ -285,19 +289,27 @@ class ExplorePageTool(Tool):
         """
         
         dom_result = self.browser_controller.evaluate_script(analysis_script)
-        
         if not dom_result.get('success'):
-            return {'success': False, 'error': 'Failed to analyze DOM'}
+            return {'success': False, 'error': "Failed to analyze page."}
+
+        # 1. Save the huge data to an internal variable for later use
+        res = dom_result.get('result')
+        self.browser_controller.last_ground_truth = res
         
-        # Capture screenshot for exploration phase
-        screenshot = self.browser_controller.capture_screenshot(full_page=False)
-        current_url = self.browser_controller.page.url if self.browser_controller.page else None
-        
+        # 2. Trigger the screenshot save-to-disk
+        self.browser_controller.capture_screenshot(name="exploration")
+
+        # 3. RETURN ONLY A SUMMARY TO THE LLM
+        summary = (f"Exploration successful. Page Title: '{res.get('title', 'No Title')}'. "
+                   f"Found {len(res.get('buttons', []))} buttons, {len(res.get('inputs', []))} inputs, "
+                   f"and {len(res.get('forms', []))} forms.")
+
+        # FIX: RETURN A DICTIONARY
         return {
             'success': True,
-            'ground_truth': dom_result.get('result'),
-            'screenshot': screenshot,
-            'current_url': current_url
+            'ground_truth': res,
+            'screenshot': self.browser_controller.last_screenshot_b64,
+            'message': summary
         }
 
 
@@ -349,9 +361,9 @@ class AnalyzeElementsTool(Tool):
                     }}
                     
                     // Attribute-based
-                    if (el.name) locators.name = `[${{el.tagName.toLowerCase()}}[name="${{el.name}}"]]`;
+                    if (el.name) locators.name = `${{el.tagName.toLowerCase()}}[name="${{el.name}}"]`;
                     if (el.getAttribute('data-testid')) {{
-                        locators.testid = `[data-testid="${{el.getAttribute('data-testid')}}"]`;
+                        locators.testid = `${{el.tagName.toLowerCase()}}[data-testid="${{el.getAttribute('data-testid')}}"]`;
                     }}
                     
                     // Text-based (semantic)
@@ -385,7 +397,10 @@ class AnalyzeElementsTool(Tool):
         
         result = self.browser_controller.evaluate_script(script)
         if result.get('success'):
-            return {'success': True, 'analysis': result.get('result')}
+            analysis = result.get('result')
+            elements = analysis.get('elements', [])
+            summary = [f"- {e['tag']} '{e['text']}': recommended locator: {e['recommended']}" for e in elements]
+            return f"Found {analysis['found']} elements. Top matches:\n" + "\n".join(summary)
         return result
 
 
@@ -881,11 +896,13 @@ class ExecuteTestTool(Tool):
                 
                 # Capture screenshot after each step for evidence
                 sleep(0.5)
-                screenshot = self.browser_controller.capture_screenshot(full_page=False)
-                if screenshot:
+                self.browser_controller.capture_screenshot(full_page=False)
+                screenshot_for_report = self.browser_controller.last_screenshot_b64
+                
+                if screenshot_for_report:
                     execution_result['screenshots'].append({
                         'step': i + 1,
-                        'screenshot': screenshot
+                        'screenshot': screenshot_for_report
                     })
                 
             except Exception as e:
@@ -900,7 +917,8 @@ class ExecuteTestTool(Tool):
             execution_result['steps'].append(step_result)
         
         execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
-        return execution_result
+        status = "PASSED" if execution_result['status'] == 'passed' else "FAILED"
+        return f"Test '{test_name}' execution {status}. Ran {len(execution_result['steps'])} steps. Screenshots were saved for the report."
 
 
 class GenerateReportTool(Tool):
@@ -921,7 +939,22 @@ class GenerateReportTool(Tool):
     def __init__(self):
         super().__init__()
 
-    def forward(self, execution_result: Dict) -> str:
+    def forward(self, execution_result: Any) -> str:
+        """
+        Generates a detailed test execution report. 
+        Handles both raw dictionary data and summary strings by checking the controller cache.
+        """
+        # 1. Check if the LLM passed the summary string instead of the raw data dictionary
+        if isinstance(execution_result, str):
+            # Retrieve the full dictionary we saved in ExecuteTestTool.forward()
+            execution_result = getattr(self.browser_controller, 'last_execution_result', None)
+        
+        # 2. Safety check: If we still don't have a valid dictionary, exit gracefully
+        if not execution_result or not isinstance(execution_result, dict):
+            return ("Error: No detailed execution data found. "
+                    "Please ensure 'execute_test' was run before calling this tool.")
+
+        # 3. Proceed with the report generation using the dictionary data
         report_lines = [
             "# Test Execution Report",
             f"\n**Test Name:** {execution_result.get('test_name', 'Unknown')}",
@@ -931,6 +964,7 @@ class GenerateReportTool(Tool):
             "\n## Step-by-Step Execution Log\n"
         ]
         
+        # Format the step logs
         for step in execution_result.get('steps', []):
             status_icon = {
                 'passed': '✅',
@@ -947,13 +981,16 @@ class GenerateReportTool(Tool):
             if step.get('error'):
                 report_lines.append(f"   Error: {step.get('error')}")
         
+        # Add summary of errors if they exist
         if execution_result.get('errors'):
             report_lines.append("\n## Errors\n")
             for error in execution_result.get('errors', []):
                 report_lines.append(f"- Step {error.get('step', '?')}: {error.get('error', 'Unknown error')}")
         
+        # Add evidence summary
         report_lines.append(f"\n## Evidence\n")
-        report_lines.append(f"- Screenshots captured: {len(execution_result.get('screenshots', []))}")
+        screenshots = execution_result.get('screenshots', [])
+        report_lines.append(f"- Screenshots captured: {len(screenshots)}")
         
         return '\n'.join(report_lines)
 
@@ -1011,18 +1048,18 @@ class LLMAgent:
         try:
             # Initialize models (using free-tier models to avoid payment limits)
             self.main_model = InferenceClientModel(
-                model_id="meta-llama/Llama-3.1-8B-Instruct",
-                token=self.hf_token
+            model_id="meta-llama/Llama-3.1-8B-Instruct",
+            token=self.hf_token
             )
             
             self.vision_model = InferenceClientModel(
-                model_id="Qwen/Qwen2-VL-7B-Instruct",
-                token=self.hf_token
+            model_id="Qwen/Qwen2.5-VL-7B-Instruct",
+            token=self.hf_token
             )
             
             self.code_model = InferenceClientModel(
-                model_id="bigcode/starcoder2-15b",
-                token=self.hf_token
+            model_id="Qwen/Qwen2.5-Coder-32B-Instruct",
+            token=self.hf_token
             )
             
             # Create all tools for the workflow
@@ -1053,7 +1090,7 @@ class LLMAgent:
                 tools=self.tools,
                 model=self.main_model,
                 additional_authorized_imports=["playwright", "time", "json", "re", "datetime"],
-                max_steps=25,
+                max_steps=15,
                 verbosity_level=1,
             )
             
@@ -1209,7 +1246,7 @@ class LLMAgent:
                 )
                 
                 # Generate summary for human
-                summary = self._generate_exploration_summary(ground_truth_data)
+                summary = summary = result.get('message', "Exploration complete.")
                 
                 response_time = (time() - start_time) * 1000
                 self.metrics.record_request(response_time, tokens=500)  # Estimate
@@ -1743,6 +1780,24 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
         3. Implementation: Generate code for approved tests
         4. Verification: Execute tests and collect evidence
         """
+        clean_msg = message.lower().strip()
+        if clean_msg == "reset":
+            print("\n--- [SYSTEM] Hard Reset Triggered ---")
+            self.current_phase = WorkflowPhase.IDLE
+            self.ground_truth = None
+            self.proposed_test_cases = []
+            self.approved_test_cases = []
+            self.generated_code = {}
+            self.execution_results = []
+            self.chat_history = [] # Optional: clear chat too
+            
+            return {
+                'text': "🔄 **System Reset Successful.** Internal state and phases have been cleared. Send a URL to start a new Phase 1 exploration.",
+                'phase': 'idle',
+                'success': True,
+                'metrics': self.metrics.to_dict()
+            }
+        
         start_time = time()
         timestamp = datetime.now(timezone.utc).isoformat()
         
@@ -1814,27 +1869,41 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
         """Route message to appropriate handler based on intent"""
         
         # Phase 1: Exploration - detect URL input
-        url_match = re.search(r'https?://[^\s<>"{}|\\^`\[\]]+', message)
-        if url_match and ('test' in lower_message or 'explore' in lower_message or 
-                          'analyze' in lower_message or self.current_phase == WorkflowPhase.IDLE):
-            url = url_match.group()
-            result = self.start_exploration(url)
-            
-            # Automatically propose test cases after exploration
-            if result.get('success'):
-                proposal = self.propose_test_cases()
-                result['message'] += "\n\n---\n\n" + proposal.get('message', '')
-                result['test_cases'] = proposal.get('test_cases', [])
-            
-            return result
+        url_pattern = r'(https?://[^\s]+|www\.[^\s]+|[a-zA-Z0-9.-]+\.[a-z]{2,}/?[^\s]*)'
+        url_match = re.search(url_pattern, message)
         
+        if url_match:
+            url = url_match.group()
+            # Force https if missing
+            if not url.startswith('http'):
+                url = 'https://' + url
+                    
+            print(f"--- [DEBUG] Phase 1 Triggered for URL: {url} ---")
+            try:
+                result = self.start_exploration(url)
+                print(f"--- [DEBUG] Exploration Result: {truncate_screenshot(result)} ---")
+                
+                if result.get('success'):
+                    print("--- [DEBUG] Exploration Successful, Proposing Tests... ---")
+                    proposal = self.propose_test_cases()
+                    result['message'] += "\n\n---\n\n" + proposal.get('message', '')
+                    result['test_cases'] = proposal.get('test_cases', [])
+                else:
+                    # If it failed, ensure there's a message for the UI to show
+                    if 'message' not in result:
+                        result['message'] = f"❌ Exploration failed: {result.get('error', 'Unknown error')}"
+                return result
+            
+            except Exception as e:
+                print(f"--- [DEBUG] CRASH in _route_message: {str(e)} ---")
+                return {'success': False, 'message': f"Internal Agent Error: {str(e)}", 'phase': 'idle'}
+        
+        print(f"--- [DEBUG] No URL found. Checking Phase: {self.current_phase.value} ---")
         # Handle "search" command - help user find correct URL
         if lower_message.startswith('search '):
-            query = message[7:].strip()  # Remove "search " prefix
-            return self._search_for_website(query)
-        
-        # Phase 2: Collaborative Design - handle feedback
-        if any(keyword in lower_message for keyword in ['approve', 'reject', 'revise']):
+            return self._search_for_website(message[7:].strip())
+            
+        if any(k in lower_message for k in ['approve', 'reject', 'revise']):
             return self.handle_test_case_feedback(message)
         
         # Phase 2: Request test case proposals
@@ -1846,7 +1915,7 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
             return self.generate_test_code()
         
         # Phase 4: Verification - execute tests
-        if any(keyword in lower_message for keyword in ['run test', 'execute test', 'verify', 'run all']):
+        if any(k in lower_message for k in ['run test', 'execute', 'verify']):
             return self.execute_tests()
         
         # Phase 4: Refactoring
@@ -1873,6 +1942,7 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
             return self._get_status_response()
         
         # Default: use the main agent for general queries
+        print("--- [DEBUG] Falling back to Main Agent Chat ---")
         return self._run_main_agent(message)
     
     def _get_welcome_message(self) -> str:
@@ -1977,10 +2047,12 @@ Example: `Test https://example.com/login`
     
     def _run_main_agent(self, message: str) -> Dict:
         """Run the main orchestration agent for general queries"""
+        print(f"DEBUG: Starting Agent Loop for task: {message}") # <--- ADD THIS
         try:
             playwright_instructions = self._get_playwright_instructions()
             result = self.agent.run(message + playwright_instructions)
             
+            print(f"DEBUG: Agent Loop Finished.")
             return {
                 'success': True,
                 'phase': self.current_phase.value,
@@ -2069,8 +2141,8 @@ Always verify results after each action.
                 sleep(2)  # Wait for results
             
             # Capture screenshot of search results
-            screenshot = self.browser_controller.capture_screenshot()
-            
+            self.browser_controller.capture_screenshot()
+            screenshot_for_ui = self.browser_controller.last_screenshot_b64
             # Try to extract search result links
             results_script = """
             (() => {
@@ -2103,7 +2175,7 @@ Always verify results after each action.
             return {
                 'success': True,
                 'phase': 'idle',
-                'screenshot': screenshot,
+                'screenshot': screenshot_for_ui,
                 'search_results': search_results,
                 'message': f"🔍 **Google Search Results for '{query}'**\n\n"
                           f"I've searched Google for you. Look at the browser screenshot to see the results.{results_text}\n\n"

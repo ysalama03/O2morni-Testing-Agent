@@ -1,5 +1,14 @@
 import React from 'react';
 
+const formatDuration = (seconds) => {
+  if (!seconds || seconds === 0) return "0ms";
+  // If the value is 1 or greater, it's likely seconds
+  if (seconds >= 1) {
+    return `${seconds.toFixed(2)}s`;
+  }
+  // Otherwise, convert to milliseconds for readability
+  return `${(seconds * 1000).toFixed(0)}ms`;
+};
 /**
  * MetricsPanel Component
  * Displays real-time metrics: Average Response Time & Token Usage
@@ -59,7 +68,7 @@ const MetricsPanel = ({ metrics = {}, workflowPhase = 'idle' }) => {
           <div className="metric-info">
             <div className="metric-label">Avg Response Time</div>
             <div className="metric-value highlight">
-              {avgResponseTime.toFixed(2)}ms
+              {formatDuration(avgResponseTime)}
             </div>
           </div>
         </div>
@@ -118,10 +127,11 @@ const MetricsPanel = ({ metrics = {}, workflowPhase = 'idle' }) => {
                 key={index} 
                 className="chart-bar"
                 style={{ 
-                  height: `${Math.min(time / 50, 100)}%`,
-                  backgroundColor: time > 3000 ? '#ef4444' : time > 1000 ? '#f59e0b' : '#10b981'
+                  // If 'time' is in seconds (like 2.43), we multiply by 1000 to keep the logic consistent
+                  height: `${Math.min((time >= 1 ? time * 1000 : time) / 50, 100)}%`,
+                  backgroundColor: time > 3 ? '#ef4444' : time > 1 ? '#f59e0b' : '#10b981'
                 }}
-                title={`${time.toFixed(0)}ms`}
+                title={formatDuration(time)}
               />
             ))}
           </div>

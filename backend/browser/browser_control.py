@@ -3,6 +3,7 @@ Browser Control Module
 Manages Playwright browser instance for testing and interaction
 """
 
+from datetime import datetime
 from playwright.sync_api import sync_playwright, Browser, Page, BrowserContext
 import base64
 import os
@@ -130,21 +131,27 @@ class BrowserController:
                 'loading': False
             }
     
-    def capture_screenshot(self, full_page: bool = False) -> Optional[str]:
-        """
-        Capture a screenshot and return as base64 data URL
-        This method is for agent operations only (not for polling endpoints)
-        """
+    def capture_screenshot(self, name="step") -> str:
+        """Saves screenshot to disk and returns a short text description."""
         if not self.page:
-            return None
+            return "Error: No active page."
         
-        try:
-            screenshot_bytes = self.page.screenshot(full_page=full_page)
-            screenshot_b64 = base64.b64encode(screenshot_bytes).decode('utf-8')
-            return f'data:image/png;base64,{screenshot_b64}'
-        except Exception as e:
-            print(f'Error capturing screenshot: {e}')
-            return None
+        # Create directory if it doesn't exist
+        path = os.path.join(os.getcwd(), "screenshots")
+        os.makedirs(path, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%H%M%S")
+        filename = f"{name}_{timestamp}.png"
+        filepath = os.path.join(path, filename)
+        
+        # Save the file
+        self.page.screenshot(path=filepath)
+        
+        # Convert to base64 ONLY for the frontend variable, NOT for the LLM return
+        with open(filepath, "rb") as f:
+            self.last_screenshot_b64 = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+            
+        return f"Screenshot saved successfully to {filename}. The page is now visible."
     
     def navigate_to(self, url: str) -> Dict:
         """Navigate to a URL"""

@@ -4,6 +4,15 @@ import BrowserView from './BrowserView';
 import MetricsPanel from './MetricsPanel';
 import { sendMessage, getBrowserState, getMetrics } from '../api';
 
+const formatDuration = (seconds) => {
+  if (!seconds || seconds === 0) return "0ms";
+  // If the value is 1 or greater, it's likely seconds
+  if (seconds >= 1) {
+    return `${seconds.toFixed(2)}s`;
+  }
+  // Otherwise, convert to milliseconds for readability
+  return `${(seconds * 1000).toFixed(0)}ms`;
+};
 /**
  * Dashboard Component
  * Main application dashboard that orchestrates the 4-phase testing workflow
@@ -25,9 +34,17 @@ const Dashboard = () => {
       try {
         const [browserData, metricsData] = await Promise.all([
           getBrowserState(),
-          getMetrics()
+          getMetrics(),
+          fetch('/api/chat/status').then(res => res.json())
         ]);
-        setBrowserState(browserData);
+        
+        setBrowserState(prev => ({
+          ...prev,
+          ...browserData,
+          // Keep existing screenshot if the polled data is empty
+          screenshot: browserData.screenshot || prev.screenshot,
+          url: browserData.url || prev.url
+        }));
         if (metricsData) {
           setMetrics(prev => ({ ...prev, ...metricsData }));
         }
@@ -105,7 +122,7 @@ const Dashboard = () => {
           <div className="header-metric">
             <span className="metric-icon">⏱️</span>
             <span className="metric-value">
-              {(metrics.average_response_time || 0).toFixed(0)}ms
+              {formatDuration(metrics.average_response_time || 0)}
             </span>
           </div>
           <div className="header-metric">
