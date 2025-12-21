@@ -41,10 +41,22 @@ const Dashboard = () => {
             getMetrics()
           ]);
           
+          // Extract latest screenshot from execution progress steps (most up-to-date)
+          let latestScreenshot = browserData.screenshot;
+          if (progressData && progressData.progress && progressData.progress.steps) {
+            // Find the latest step with a screenshot
+            const stepsWithScreenshots = progressData.progress.steps
+              .filter(step => step.screenshot)
+              .sort((a, b) => (b.step_number || 0) - (a.step_number || 0));
+            if (stepsWithScreenshots.length > 0) {
+              latestScreenshot = stepsWithScreenshots[0].screenshot;
+            }
+          }
+          
           setBrowserState(prev => ({
             ...prev,
             ...browserData,
-            screenshot: browserData.screenshot || prev.screenshot,
+            screenshot: latestScreenshot || browserData.screenshot || prev.screenshot,
             url: browserData.url || prev.url,
             loading: browserData.loading || false
           }));
@@ -78,6 +90,19 @@ const Dashboard = () => {
           // Update execution progress
           if (progressData && progressData.progress) {
             setExecutionProgress(progressData.progress);
+            
+            // Extract latest screenshot from completed execution progress steps
+            if (progressData.progress.steps) {
+              const stepsWithScreenshots = progressData.progress.steps
+                .filter(step => step.screenshot)
+                .sort((a, b) => (b.step_number || 0) - (a.step_number || 0));
+              if (stepsWithScreenshots.length > 0) {
+                setBrowserState(prev => ({
+                  ...prev,
+                  screenshot: stepsWithScreenshots[0].screenshot || prev.screenshot
+                }));
+              }
+            }
             
             // If execution is completed, keep it visible for 5 seconds then clear
             if (progressData.progress.status === 'completed') {
@@ -121,6 +146,21 @@ const Dashboard = () => {
           url: null,
           loading: false
         });
+        // Clear test results and metrics
+        setMetrics({
+          testsRun: 0,
+          testsPassed: 0,
+          testsFailed: 0,
+          executionTime: 0,
+          coverage: 0,
+          average_response_time: 0,
+          total_tokens_consumed: 0,
+          total_requests: 0,
+          response_times: [],
+          errors: []
+        });
+        // Clear execution progress
+        setExecutionProgress(null);
         
         // Add reset confirmation message
         const resetMessage = {

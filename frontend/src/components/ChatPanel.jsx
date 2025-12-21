@@ -44,8 +44,8 @@ const ChatPanel = ({ onSendMessage, messages = [], workflowPhase = 'idle', isLoa
     'idle': ['Test https://example.com'],
     'exploration': ['Propose test cases'],
     'collaborative_design': ['Approve all', 'Generate code'],
-    'implementation': ['Run tests', 'Export tests'],
-    'verification': ['Run again', 'Export tests', 'Status']
+    'implementation': ['Run all tests', 'Export tests'],
+    'verification': ['Run all tests', 'Export tests', 'Status']
   };
 
   const currentActions = quickActions[workflowPhase] || [];

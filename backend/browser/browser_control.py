@@ -355,6 +355,98 @@ class BrowserController:
                 print(f'Error waiting for selector {selector}: {e}')
                 return {'success': False, 'error': str(e)}
     
+    def get_page_html(self, max_length: int = 50000) -> Dict:
+        """
+        Get the HTML content of the current page (limited to max_length for LLM processing)
+        Returns a simplified HTML structure focusing on interactive elements
+        """
+        if not self.page:
+            return {'success': False, 'error': 'Browser not initialized'}
+        
+        with self._lock:
+            try:
+                # Extract relevant HTML structure focusing on forms, inputs, buttons
+                html_extraction_script = """
+                (() => {
+                    const result = {
+                        url: window.location.href,
+                        title: document.title,
+                        forms: [],
+                        inputs: [],
+                        buttons: [],
+                        links: [],
+                        structure: ''
+                    };
+                    
+                    // Extract forms with their HTML (limit to first 5 forms)
+                    Array.from(document.querySelectorAll('form')).slice(0, 5).forEach((form, idx) => {
+                        const formHTML = form.outerHTML.substring(0, 2000); // Limit size
+                        result.forms.push({
+                            id: form.id || `form_${idx}`,
+                            html: formHTML,
+                            inputs: Array.from(form.querySelectorAll('input, select, textarea')).slice(0, 20).map(inp => ({
+                                tag: inp.tagName.toLowerCase(),
+                                type: inp.type || inp.tagName.toLowerCase(),
+                                id: inp.id,
+                                name: inp.name,
+                                placeholder: inp.placeholder,
+                                class: inp.className,
+                                html: inp.outerHTML.substring(0, 500)
+                            }))
+                        });
+                    });
+                    
+                    // Extract standalone inputs (limit to first 20)
+                    Array.from(document.querySelectorAll('input:not(form input), textarea:not(form textarea), select:not(form select)')).slice(0, 20).forEach(inp => {
+                        result.inputs.push({
+                            tag: inp.tagName.toLowerCase(),
+                            type: inp.type || inp.tagName.toLowerCase(),
+                            id: inp.id,
+                            name: inp.name,
+                            placeholder: inp.placeholder,
+                            class: inp.className,
+                            html: inp.outerHTML.substring(0, 500)
+                        });
+                    });
+                    
+                    // Extract buttons (limit to first 30)
+                    Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]')).slice(0, 30).forEach(btn => {
+                        result.buttons.push({
+                            text: btn.textContent?.trim().substring(0, 50),
+                            id: btn.id,
+                            name: btn.name,
+                            class: btn.className,
+                            type: btn.type,
+                            html: btn.outerHTML.substring(0, 500)
+                        });
+                    });
+                    
+                    // Extract important links
+                    Array.from(document.querySelectorAll('a[href]')).slice(0, 20).forEach(link => {
+                        if (link.textContent?.trim()) {
+                            result.links.push({
+                                text: link.textContent.trim().substring(0, 50),
+                                href: link.href,
+                                id: link.id,
+                                html: link.outerHTML.substring(0, 300)
+                            });
+                        }
+                    });
+                    
+                    // Get simplified page structure (body HTML, limited)
+                    const bodyHTML = document.body ? document.body.innerHTML.substring(0, 10000) : '';
+                    result.structure = bodyHTML;
+                    
+                    return result;
+                })()
+                """
+                
+                result = self.page.evaluate(html_extraction_script)
+                return {'success': True, 'html_data': result}
+            except Exception as e:
+                print(f'Error getting page HTML: {e}')
+                return {'success': False, 'error': str(e)}
+    
     def get_current_url(self) -> Optional[str]:
         """Safely get the current page URL"""
         if not self.page:

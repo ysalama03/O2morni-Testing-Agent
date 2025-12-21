@@ -1534,9 +1534,9 @@ class LLMAgent:
         self.current_phase = WorkflowPhase.EXPLORATION
         
         # Reset explored URLs for new exploration session
-        if url not in self.explored_urls:
-            self.explored_urls.clear()
-            self.ground_truths.clear()
+        # Always clear when starting a new exploration to ensure fresh discovery
+        self.explored_urls.clear()
+        self.ground_truths.clear()
         
         try:
             # First try to navigate to the URL directly
@@ -1648,8 +1648,14 @@ class LLMAgent:
             exploration_summaries = []
             
             if explore_all_urls:
+                # Ensure we're on the page before discovering URLs
+                # (Navigation was already done above, but ensure page is loaded)
+                sleep(1)  # Give page time to fully load
+                
                 # Only discover reasonable URLs (sign in, sign up, etc.)
+                print(f"🔍 Discovering navigable URLs from {url}...")
                 discovered_urls = self._discover_navigable_urls(url, max_urls=10, prioritize_reasonable=True)
+                print(f"   Found {len(discovered_urls)} URLs to explore: {discovered_urls}")
                 
                 if discovered_urls:
                     exploration_summaries.append(f"🔍 **Discovered {len(discovered_urls)} important URLs for testing**\n")
@@ -1856,7 +1862,7 @@ class LLMAgent:
                           f"Please review and provide feedback:\n"
                           f"- 'approve TC-001' to approve a test case\n"
                           f"- 'revise TC-002: add validation for...' to request changes\n"
-                          f"- 'reject TC-003' to remove a test case\n"
+                          f"- 'reject TC-003' or 'delete TC-003' to remove a test case\n"
                           f"- 'approve all' to approve all test cases",
                 'metrics': self.metrics.to_dict()
             }
@@ -2072,12 +2078,16 @@ class LLMAgent:
             for tc in self.proposed_test_cases:
                 if f'approve {tc.id.lower()}' in feedback_lower:
                     tc.status = 'approved'
-                    self.approved_test_cases.append(tc)
+                    # Add to approved_test_cases if not already there
+                    if not any(ac.id == tc.id for ac in self.approved_test_cases):
+                        self.approved_test_cases.append(tc)
                     response_messages.append(f"✅ {tc.id} approved")
                     
-                elif f'reject {tc.id.lower()}' in feedback_lower:
+                elif f'reject {tc.id.lower()}' in feedback_lower or f'delete {tc.id.lower()}' in feedback_lower or f'remove {tc.id.lower()}' in feedback_lower:
                     tc.status = 'rejected'
-                    response_messages.append(f"❌ {tc.id} rejected")
+                    # Remove from approved_test_cases if it was there
+                    self.approved_test_cases = [ac for ac in self.approved_test_cases if ac.id != tc.id]
+                    response_messages.append(f"❌ {tc.id} rejected/deleted")
                     
                 elif f'revise {tc.id.lower()}' in feedback_lower:
                     tc.status = 'needs_revision'
@@ -2152,10 +2162,28 @@ class LLMAgent:
             }
         
         # Get test cases to implement
+        # Filter out rejected test cases and only include approved ones
+        approved_only = [tc for tc in self.approved_test_cases if tc.status == 'approved']
+        
         if test_case_id:
-            test_cases = [tc for tc in self.approved_test_cases if tc.id == test_case_id]
+            test_cases = [tc for tc in approved_only if tc.id == test_case_id]
+            if not test_cases:
+                # Check if it exists but is not approved
+                exists_but_not_approved = any(tc.id == test_case_id for tc in self.approved_test_cases)
+                if exists_but_not_approved:
+                    error_msg = f'Test case {test_case_id} is not approved. Please approve it first.'
+                else:
+                    error_msg = f'Test case {test_case_id} not found in approved test cases.'
+                print(f"ERROR: {error_msg}")
+                return {
+                    'success': False,
+                    'message': f'⚠️ **{error_msg}**',
+                    'error': error_msg,
+                    'phase': 'implementation',
+                    'metrics': self.metrics.to_dict()
+                }
         else:
-            test_cases = self.approved_test_cases
+            test_cases = approved_only
         
         if not test_cases:
             error_msg = 'No approved test cases to implement. Please approve test cases first.'
@@ -2824,7 +2852,14 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
         
         # Phase 3: Implementation - generate code
         if any(keyword in lower_message for keyword in ['generate code', 'write code', 'implement', 'create code']):
-            return self.generate_test_code()
+            # Check if specific test case mentioned (e.g., "generate code TC-001")
+            tc_match = re.search(r'tc-?(\d+)', lower_message, re.IGNORECASE)
+            if tc_match:
+                test_id = f"TC-{tc_match.group(1).zfill(3)}"
+                return self.generate_test_code(test_case_id=test_id)
+            else:
+                # Generate code for all approved test cases
+                return self.generate_test_code()
         
         # Phase 4: Verification - execute tests
         if any(keyword in lower_message for keyword in ['run test', 'execute test', 'verify', 'run all', 'run tests']):
@@ -3262,6 +3297,8 @@ Always check the 'success' key in return values before proceeding.
         try:
             # Clear all workflow state
             self.ground_truth = None
+            self.ground_truths = {}  # Also clear multi-URL ground truths
+            self.explored_urls = set()  # Clear explored URLs so new exploration works
             self.proposed_test_cases = []
             self.approved_test_cases = []
             self.generated_code = {}
@@ -3272,8 +3309,8 @@ Always check the 'success' key in return values before proceeding.
             # Clear chat history
             self.chat_history = []
             
-            # Reset metrics (optional - you might want to keep metrics)
-            # self.metrics = MetricsTracker()
+            # Reset metrics to clear test counts (passed/failed)
+            self.metrics = MetricsTracker()
             
             return {
                 'success': True,
@@ -3329,6 +3366,379 @@ Always check the 'success' key in return values before proceeding.
         """Get current test execution progress for real-time updates"""
         return self.current_execution_progress
     
+    def _normalize_llm_selector(self, selector: str) -> Optional[str]:
+        """
+        Normalize and validate a selector extracted from LLM.
+        Returns None if selector is invalid or should be skipped.
+        """
+        if not selector or not selector.strip():
+            return None
+        
+        selector = selector.strip()
+        
+        # Skip CSRF token fields (hidden inputs that shouldn't be filled manually)
+        if 'csrf' in selector.lower() or 'token' in selector.lower():
+            if 'input' in selector.lower() and ('hidden' in selector.lower() or 'type="hidden"' in selector.lower()):
+                return None  # Skip CSRF tokens
+        
+        # Fix invalid selectors like "form_0 input[...]" - "form_0" is not valid CSS
+        # Replace "form_0" with just "form" or remove it
+        if selector.startswith('form_') and ' ' in selector:
+            # Pattern: "form_0 input[...]" -> "form input[...]" or "input[...]"
+            parts = selector.split(' ', 1)
+            if parts[0].startswith('form_'):
+                # Try to find the form by ID or just use the element selector
+                if len(parts) > 1:
+                    selector = parts[1]  # Use just the element part
+                else:
+                    selector = 'form'  # Fallback to generic form
+        
+        # Validate basic CSS selector syntax
+        # Check for common invalid patterns
+        if selector.startswith('form_') and not selector.startswith('form_['):
+            # "form_0" without attribute is invalid, skip it
+            return None
+        
+        # Skip selectors that are clearly invalid
+        invalid_patterns = [
+            r'^form_\d+$',  # Just "form_0", "form_1", etc.
+            r'^form_\d+\s*$',  # "form_0 " with trailing space
+        ]
+        for pattern in invalid_patterns:
+            if re.match(pattern, selector):
+                return None
+        
+        return selector
+    
+    def _validate_selector_exists(self, selector: str) -> Dict:
+        """
+        Validate that a selector actually exists on the current page.
+        Returns dict with 'exists' boolean and optional 'error' message.
+        """
+        if not selector or not self.browser_controller:
+            return {'exists': False, 'error': 'Invalid selector or browser not initialized'}
+        
+        try:
+            # Properly escape the selector for JavaScript
+            escaped_selector = selector.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+            check_script = f"""
+            (() => {{
+                try {{
+                    const el = document.querySelector('{escaped_selector}');
+                    return {{ exists: el !== null, selector: '{escaped_selector}' }};
+                }} catch(e) {{
+                    return {{ exists: false, selector: '{escaped_selector}', error: e.message }};
+                }}
+            }})()
+            """
+            result = self.browser_controller.evaluate_script(check_script)
+            if result.get('success'):
+                return result.get('result', {'exists': False})
+            return {'exists': False, 'error': 'Script evaluation failed'}
+        except Exception as e:
+            return {'exists': False, 'error': str(e)}
+    
+    def _find_alternative_selector(self, failed_selector: str, html_data: Dict, action: str) -> Optional[str]:
+        """
+        Try to find an alternative selector when the primary one fails.
+        Looks for similar elements in the HTML structure using multiple strategies.
+        """
+        if not failed_selector or not html_data:
+            return None
+        
+        # Extract the attribute we're looking for (name, id, etc.)
+        name_match = re.search(r'name=["\']([^"\']+)["\']', failed_selector)
+        id_match = re.search(r'#([^\s\[\.]+)', failed_selector)
+        tag_match = re.search(r'^(\w+)', failed_selector)  # Extract tag name (input, button, etc.)
+        tag = tag_match.group(1) if tag_match else 'input'
+        
+        # Collect all available inputs from both standalone and form inputs
+        all_inputs = []
+        for inp in html_data.get('inputs', []):
+            all_inputs.append(inp)
+        for form in html_data.get('forms', []):
+            for inp in form.get('inputs', []):
+                all_inputs.append(inp)
+        
+        # Strategy 1: Try common typos or variations of the name
+        if name_match:
+            target_name = name_match.group(1)
+            # Try common typos or variations
+            variations = [
+                target_name.replace('susbscribe', 'subscribe'),  # Fix common typo
+                target_name.replace('subscibe', 'subscribe'),
+                target_name.replace('subcribe', 'subscribe'),
+                target_name.replace('_email', ''),  # Try without _email suffix
+                target_name.replace('email', 'mail'),  # Try mail instead of email
+            ]
+            
+            # Also try partial matches (e.g., if looking for "subscribe_email", try "subscribe")
+            if '_' in target_name:
+                base_name = target_name.split('_')[0]
+                variations.append(base_name)
+            
+            for var_name in variations:
+                if var_name and var_name != target_name:
+                    # Check if this variation exists in HTML
+                    for inp in all_inputs:
+                        if inp.get('name') == var_name:
+                            return f'{tag}[name="{var_name}"]'
+        
+        # Strategy 2: Search by semantic similarity (e.g., if looking for subscribe_email, find any email input)
+        if name_match:
+            target_name = name_match.group(1).lower()
+            # If it contains keywords like "email", "subscribe", "mail", search for similar inputs
+            keywords = ['email', 'subscribe', 'mail', 'newsletter']
+            found_keywords = [kw for kw in keywords if kw in target_name]
+            
+            if found_keywords:
+                for inp in all_inputs:
+                    inp_name = (inp.get('name') or '').lower()
+                    inp_id = (inp.get('id') or '').lower()
+                    inp_placeholder = (inp.get('placeholder') or '').lower()
+                    
+                    # Check if input has similar keywords
+                    for keyword in found_keywords:
+                        if keyword in inp_name or keyword in inp_id or keyword in inp_placeholder:
+                            # Prefer name attribute, fallback to id
+                            if inp.get('name'):
+                                return f'{tag}[name="{inp.get("name")}"]'
+                            elif inp.get('id'):
+                                return f'#{inp.get("id")}'
+        
+        # Strategy 3: Try ID-based selector if name-based failed
+        if id_match:
+            target_id = id_match.group(1)
+            variations = [
+                target_id.replace('susbscribe', 'subscribe'),
+                target_id.replace('subscibe', 'subscribe'),
+            ]
+            
+            for var_id in variations:
+                if var_id != target_id:
+                    for inp in all_inputs:
+                        if inp.get('id') == var_id:
+                            return f'#{var_id}'
+        
+        # Strategy 4: If looking for email/subscribe input, find any email-type input
+        if name_match and ('email' in name_match.group(1).lower() or 'subscribe' in name_match.group(1).lower()):
+            for inp in all_inputs:
+                inp_type = (inp.get('type') or '').lower()
+                inp_name = (inp.get('name') or '').lower()
+                if inp_type == 'email' or 'email' in inp_name or 'subscribe' in inp_name:
+                    if inp.get('name'):
+                        return f'{tag}[name="{inp.get("name")}"]'
+                    elif inp.get('id'):
+                        return f'#{inp.get("id")}'
+        
+        return None
+    
+    def _search_page_for_similar_input(self, failed_selector: str, keywords: List[str]) -> Optional[str]:
+        """
+        Search the actual page DOM for inputs matching keywords.
+        This is more reliable than HTML data structure as it queries the live page.
+        """
+        if not failed_selector or not self.browser_controller:
+            return None
+        
+        try:
+            # Build a search script that looks for inputs matching keywords
+            keywords_str = ', '.join([f'"{kw}"' for kw in keywords])
+            search_script = f"""
+            (() => {{
+                const keywords = [{keywords_str}];
+                const inputs = document.querySelectorAll('input, textarea');
+                const matches = [];
+                
+                inputs.forEach(inp => {{
+                    const name = (inp.name || '').toLowerCase();
+                    const id = (inp.id || '').toLowerCase();
+                    const placeholder = (inp.placeholder || '').toLowerCase();
+                    const type = (inp.type || '').toLowerCase();
+                    
+                    // Check if any keyword matches
+                    for (const keyword of keywords) {{
+                        if (name.includes(keyword) || id.includes(keyword) || 
+                            placeholder.includes(keyword) || (type === 'email' && keyword === 'email')) {{
+                            matches.push({{
+                                name: inp.name,
+                                id: inp.id,
+                                type: inp.type,
+                                selector: inp.name ? `input[name="${{inp.name}}"]` : (inp.id ? `#${{inp.id}}` : null)
+                            }});
+                            break;
+                        }}
+                    }}
+                }});
+                
+                // Return the first match with a name attribute (most reliable)
+                const nameMatch = matches.find(m => m.name);
+                if (nameMatch) return nameMatch.selector;
+                
+                // Fallback to ID match
+                const idMatch = matches.find(m => m.id);
+                if (idMatch) return idMatch.selector;
+                
+                return null;
+            }})()
+            """
+            
+            result = self.browser_controller.evaluate_script(search_script)
+            if result.get('success') and result.get('result'):
+                return result.get('result')
+        except Exception as e:
+            print(f"    ⚠️  Error searching page for similar input: {e}")
+        
+        return None
+    
+    def _should_skip_field(self, selector: str, action: str) -> bool:
+        """
+        Determine if a field should be skipped (e.g., CSRF tokens, hidden fields).
+        """
+        if action != 'fill':
+            return False
+        
+        selector_lower = selector.lower()
+        
+        # Skip CSRF token fields
+        if 'csrf' in selector_lower or 'token' in selector_lower:
+            if 'input' in selector_lower:
+                return True
+        
+        # Skip hidden input fields
+        if 'input[type="hidden"]' in selector_lower or 'input[type=hidden]' in selector_lower:
+            return True
+        
+        # Skip fields with name containing "csrf" or "token"
+        name_match = re.search(r'name=["\']([^"\']*)["\']', selector_lower)
+        if name_match:
+            field_name = name_match.group(1)
+            if 'csrf' in field_name or 'token' in field_name:
+                return True
+        
+        return False
+    
+    def _generate_test_data(self, value: str, selector: str) -> str:
+        """
+        Generate appropriate test data when placeholder/description text is detected.
+        Detects patterns like "valid user email address", "test_data", etc. and generates
+        actual test values based on the field type (email, password, name, etc.).
+        """
+        if not value:
+            value = "test_data"
+        
+        value_lower = value.lower().strip()
+        
+        # List of placeholder patterns that indicate we need to generate actual data
+        placeholder_patterns = [
+            r'valid\s+(?:user\s+)?(?:email|e-mail)',
+            r'valid\s+(?:user\s+)?password',
+            r'valid\s+(?:user\s+)?(?:name|username)',
+            r'valid\s+data',
+            r'test\s+data',
+            r'test_data',
+            r'placeholder',
+            r'sample\s+(?:email|password|data)',
+            r'example\s+(?:email|password|data)',
+        ]
+        
+        # Check if value is a placeholder
+        is_placeholder = any(re.search(pattern, value_lower) for pattern in placeholder_patterns)
+        
+        if not is_placeholder and len(value) > 3 and '@' not in value_lower:
+            # Check if it looks like a description rather than actual data
+            # Descriptions are usually longer and contain words like "with", "address", etc.
+            description_words = ['with', 'address', 'user', 'valid', 'invalid', 'field', 'form']
+            if any(word in value_lower for word in description_words) and len(value.split()) > 2:
+                is_placeholder = True
+        
+        if not is_placeholder:
+            # Value looks like actual data, return as-is
+            return value
+        
+        # Generate appropriate test data based on selector and value hints
+        selector_lower = selector.lower()
+        
+        # Email field detection
+        if 'email' in value_lower or 'email' in selector_lower or 'e-mail' in selector_lower:
+            return "testuser@example.com"
+        
+        # Password field detection
+        if 'password' in value_lower or 'password' in selector_lower or 'pass' in selector_lower:
+            return "TestPassword123!"
+        
+        # Name/username field detection
+        if 'name' in value_lower or 'username' in value_lower or 'user' in selector_lower:
+            if 'name' in selector_lower:
+                return "Test User"
+            return "testuser"
+        
+        # Phone number field
+        if 'phone' in value_lower or 'phone' in selector_lower or 'tel' in selector_lower:
+            return "1234567890"
+        
+        # Default: generate based on common field names
+        if 'email' in selector_lower:
+            return "testuser@example.com"
+        elif 'password' in selector_lower or 'pass' in selector_lower:
+            return "TestPassword123!"
+        elif 'name' in selector_lower:
+            return "Test User"
+        elif 'phone' in selector_lower or 'tel' in selector_lower:
+            return "1234567890"
+        else:
+            # Generic test data
+            return "test_data"
+    
+    def _extract_value_from_code(self, test_code: str, selector: str) -> Optional[str]:
+        """
+        Extract the fill value for a given selector from the generated test code.
+        This ensures we use the actual values from the code (e.g., 'testUser@gmail.com')
+        instead of generic LLM-generated values.
+        """
+        try:
+            # Try to find page.fill(selector, value) pattern
+            # Match: page.fill('selector', 'value') or await page.fill("selector", "value")
+            pattern = rf'(?:await\s+)?page\.fill\(["\']{re.escape(selector)}["\']\s*,\s*["\']([^"\']+)["\']'
+            match = re.search(pattern, test_code, re.IGNORECASE)
+            if match:
+                return match.group(1)
+            
+            # Also try with normalized selector (if selector has quotes, try without)
+            selector_clean = selector.strip('"\'')
+            pattern2 = rf'(?:await\s+)?page\.fill\(["\']{re.escape(selector_clean)}["\']\s*,\s*["\']([^"\']+)["\']'
+            match2 = re.search(pattern2, test_code, re.IGNORECASE)
+            if match2:
+                return match2.group(1)
+            
+            # Try to find by matching selector pattern more flexibly
+            # Look for any fill with a selector that matches (contains the key part)
+            fill_pattern = r'(?:await\s+)?page\.fill\(["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']'
+            all_fills = re.findall(fill_pattern, test_code, re.IGNORECASE)
+            
+            # Try to match selector (could be partial match for data-testid, name, etc.)
+            selector_key = selector_clean
+            if '=' in selector_key:
+                # For attribute selectors like [data-testid="email"], extract the key part
+                attr_match = re.search(r'\[([^=]+)=["\']?([^"\']+)["\']?\]', selector_key)
+                if attr_match:
+                    attr_name = attr_match.group(1)
+                    attr_value = attr_match.group(2)
+                    # Look for fills where selector contains this attribute value
+                    for code_sel, code_val in all_fills:
+                        if attr_value in code_sel or attr_name in code_sel:
+                            return code_val
+            else:
+                # For ID/class selectors, try to match
+                for code_sel, code_val in all_fills:
+                    if selector_key in code_sel or code_sel in selector_key:
+                        return code_val
+            
+        except Exception as e:
+            print(f"Warning: Could not extract value from code for selector {selector}: {e}")
+        
+        return None
+    
     def _extract_selectors_using_llm(self, test_case: TestCase, url: str) -> Dict:
         """
         Use LLM to extract correct selectors by analyzing page HTML and test case steps.
@@ -3343,7 +3753,29 @@ Always check the 'success' key in return values before proceeding.
             html_data = html_result.get('html_data', {})
             
             # Build prompt for LLM to extract selectors
-            prompt = f"""You are a web testing expert. Given a test case and the page HTML structure, extract the correct CSS selectors for each action.
+            # Extract actual attribute values from HTML for better accuracy
+            actual_inputs = []
+            for inp in html_data.get('inputs', [])[:15]:
+                if inp.get('name'):
+                    actual_inputs.append({
+                        'name': inp.get('name'),
+                        'id': inp.get('id'),
+                        'type': inp.get('type'),
+                        'html': inp.get('html', '')[:200]  # Include HTML snippet for verification
+                    })
+            
+            actual_buttons = []
+            for btn in html_data.get('buttons', [])[:15]:
+                actual_buttons.append({
+                    'id': btn.get('id'),
+                    'text': btn.get('text', '')[:50],
+                    'type': btn.get('type'),
+                    'html': btn.get('html', '')[:200]
+                })
+            
+            prompt = f"""You are a web testing expert. Given a test case and the page HTML structure, extract the CORRECT CSS selectors for each action.
+
+CRITICAL: You must match EXACT attribute values from the HTML structure below. Copy attribute values EXACTLY as they appear - do not guess or make typos.
 
 Test Case: {test_case.name}
 URL: {url}
@@ -3354,20 +3786,31 @@ Test Steps:
 
 Page HTML Structure:
 Forms: {json.dumps(html_data.get('forms', [])[:3], indent=2)}
-Buttons: {json.dumps(html_data.get('buttons', [])[:10], indent=2)}
-Inputs: {json.dumps(html_data.get('inputs', [])[:10], indent=2)}
+Buttons: {json.dumps(actual_buttons, indent=2)}
+Inputs: {json.dumps(actual_inputs, indent=2)}
+
+IMPORTANT RULES:
+1. Use valid CSS selectors only (e.g., #id, .class, [name="value"], input[name="fieldname"])
+2. DO NOT use invalid selectors like "form_0" - use "form" or the actual element selector
+3. SKIP CSRF token fields and hidden input fields - do not include them in selectors
+4. For form inputs, use: input[name="fieldname"] or #field-id or .field-class
+5. Selector priority: data-testid > id > name > class > text content
+6. CRITICAL: Copy attribute values EXACTLY from the HTML above - check spelling carefully (e.g., "subscribe" not "susbscribe")
+7. If an input has name="subscribe_email", use input[name="subscribe_email"] - copy the name EXACTLY
+8. Verify each selector matches an element in the HTML structure provided
 
 For each test step, identify:
 1. What element needs to be interacted with
-2. The best CSS selector for that element (priority: data-testid > id > name > class > text)
+2. The best CSS selector for that element (matching EXACT attribute values from HTML)
+3. Skip any CSRF tokens, hidden fields, or security tokens
 
 Return a JSON object with this structure:
 {{
   "selectors": {{
     "step_1": {{
       "action": "navigate|fill|click|wait",
-      "selector": "CSS selector here",
-      "value": "value if fill action"
+      "selector": "valid CSS selector here (with EXACT attribute values from HTML)",
+      "value": "value if fill action (skip for CSRF/hidden fields)"
     }},
     ...
   }}
@@ -3382,30 +3825,85 @@ Only return the JSON, no other text:"""
                     response = self.main_model(messages)
                     response_text = response.content if hasattr(response, 'content') else str(response)
                     
-                    # Extract JSON from response
-                    json_match = re.search(r'\{[^{}]*"selectors"[^{}]*\{[^{}]*\{[^}]*\}[^}]*\}[^}]*\}', response_text, re.DOTALL)
+                    # Clean the response text
+                    cleaned_text = response_text.strip()
+                    
+                    # Try to extract JSON from markdown code blocks first
+                    json_code_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned_text, re.DOTALL)
+                    if json_code_block:
+                        cleaned_text = json_code_block.group(1)
+                    
+                    # Try multiple JSON extraction strategies
+                    json_candidates = []
+                    
+                    # Strategy 1: Look for JSON object with "selectors" key
+                    json_match = re.search(r'\{[^{}]*"selectors"[^{}]*\{[^{}]*\{[^}]*\}[^}]*\}[^}]*\}', cleaned_text, re.DOTALL)
                     if json_match:
-                        selectors_data = json.loads(json_match.group())
-                        return {'success': True, 'selectors': selectors_data.get('selectors', {})}
-                    else:
-                        # Try to parse entire response as JSON
+                        json_candidates.append(json_match.group())
+                    
+                    # Strategy 2: Try to find the largest JSON object in the response
+                    brace_count = 0
+                    start_idx = -1
+                    for i, char in enumerate(cleaned_text):
+                        if char == '{':
+                            if start_idx == -1:
+                                start_idx = i
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0 and start_idx != -1:
+                                json_candidates.append(cleaned_text[start_idx:i+1])
+                                start_idx = -1
+                    
+                    # Strategy 3: Try entire cleaned text
+                    json_candidates.append(cleaned_text)
+                    
+                    # Try parsing each candidate
+                    for candidate in json_candidates:
                         try:
-                            selectors_data = json.loads(response_text)
-                            return {'success': True, 'selectors': selectors_data.get('selectors', {})}
-                        except:
-                            pass
+                            # Clean common JSON issues
+                            # Remove trailing commas before closing braces/brackets
+                            candidate = re.sub(r',(\s*[}\]])', r'\1', candidate)
+                            # Fix unquoted keys (if any)
+                            candidate = re.sub(r'(\w+):', r'"\1":', candidate)
+                            
+                            selectors_data = json.loads(candidate)
+                            if 'selectors' in selectors_data:
+                                return {'success': True, 'selectors': selectors_data.get('selectors', {})}
+                        except json.JSONDecodeError as je:
+                            # Try to fix more issues and retry once
+                            try:
+                                # Remove comments (JSON doesn't support comments)
+                                candidate = re.sub(r'//.*?$', '', candidate, flags=re.MULTILINE)
+                                candidate = re.sub(r'/\*.*?\*/', '', candidate, flags=re.DOTALL)
+                                selectors_data = json.loads(candidate)
+                                if 'selectors' in selectors_data:
+                                    return {'success': True, 'selectors': selectors_data.get('selectors', {})}
+                            except:
+                                continue
+                        except Exception:
+                            continue
+                    
+                    # If all parsing failed, log the response for debugging
+                    print(f"⚠️  Could not parse LLM JSON response. Response preview: {response_text[:500]}")
+                    
                 except Exception as e:
                     print(f"Error using LLM for selector extraction: {e}")
+                    import traceback
+                    traceback.print_exc()
             
-            return {'success': False, 'error': 'LLM selector extraction failed'}
+            return {'success': False, 'error': 'LLM selector extraction failed - could not parse JSON response'}
         except Exception as e:
             print(f"Error in _extract_selectors_using_llm: {e}")
             return {'success': False, 'error': str(e)}
     
     def _execute_generated_test_code(self, test_id: str, test_code: str, test_case: TestCase, test_name: str) -> Dict:
+        # Store test_code for value extraction
+        self._current_test_code = test_code
         """
         Execute the generated Python test code by extracting Playwright actions and executing them
-        on the visible browser page. Uses LLM-based selector extraction as fallback.
+        on the visible browser page. Tries LLM-based selector extraction first (most accurate), 
+        then falls back to regex extraction, then basic step execution.
         """
         execution_result = {
             'test_name': test_name,
@@ -3417,7 +3915,331 @@ Only return the JSON, no other text:"""
         }
         
         try:
-            # First, try to extract actions from the Python code using regex
+            # STEP 1: Try LLM-based selector extraction first (most accurate - analyzes actual page HTML)
+            # But first, ensure we're on the correct page
+            test_url = test_case.url or ''
+            if test_url:
+                # Navigate to the test URL first so LLM can analyze the actual page
+                nav_result = self.browser_controller.navigate_to(test_url)
+                if nav_result.get('success'):
+                    sleep(1)  # Wait for page to load
+                    print(f"📍 Navigated to {test_url} for LLM-based selector extraction")
+            
+            # Try LLM-based extraction
+            print(f"🤖 Trying LLM-based selector extraction (analyzing page HTML)...")
+            llm_selectors = self._extract_selectors_using_llm(test_case, test_url)
+            
+            if llm_selectors.get('success') and llm_selectors.get('selectors'):
+                print(f"   ✓ LLM extracted {len(llm_selectors['selectors'])} selectors from page HTML")
+                selectors = llm_selectors['selectors']
+                
+                # Validate selectors before execution
+                html_result = self.browser_controller.get_page_html()
+                html_data = html_result.get('html_data', {}) if html_result.get('success') else {}
+                
+                # Pre-validate all selectors
+                validated_selectors = {}
+                for step_key, selector_info in selectors.items():
+                    selector = selector_info.get('selector', '')
+                    normalized = self._normalize_llm_selector(selector)
+                    if normalized:
+                        validation = self._validate_selector_exists(normalized)
+                        if validation.get('exists'):
+                            validated_selectors[step_key] = selector_info
+                        else:
+                            # Try to find alternative selector
+                            alt_selector = self._find_alternative_selector(normalized, html_data, selector_info.get('action', ''))
+                            if alt_selector:
+                                # Validate the alternative selector too
+                                alt_validation = self._validate_selector_exists(alt_selector)
+                                if alt_validation.get('exists'):
+                                    print(f"    🔄 Found alternative selector for {step_key}: {alt_selector} (original: {normalized})")
+                                    selector_info['selector'] = alt_selector
+                                    validated_selectors[step_key] = selector_info
+                                else:
+                                    print(f"    ⚠️  Selector validation failed for {step_key}: {normalized} - {validation.get('error', 'Element not found')}")
+                                    print(f"       Alternative selector also failed: {alt_selector}")
+                                    # Still include it but mark for retry during execution
+                                    validated_selectors[step_key] = selector_info
+                            else:
+                                print(f"    ⚠️  Selector validation failed for {step_key}: {normalized} - {validation.get('error', 'Element not found')}")
+                                # Try searching the page directly for similar inputs
+                                if 'email' in normalized.lower() or 'subscribe' in normalized.lower():
+                                    keywords = ['email', 'subscribe', 'mail', 'newsletter']
+                                    page_selector = self._search_page_for_similar_input(normalized, keywords)
+                                    if page_selector:
+                                        page_validation = self._validate_selector_exists(page_selector)
+                                        if page_validation.get('exists'):
+                                            print(f"    🔄 Found page-based alternative: {page_selector} (original: {normalized})")
+                                            selector_info['selector'] = page_selector
+                                            validated_selectors[step_key] = selector_info
+                                            continue
+                                    
+                                    # Log available inputs for debugging
+                                    available_inputs = []
+                                    for inp in html_data.get('inputs', []):
+                                        if inp.get('name'):
+                                            available_inputs.append(f"input[name=\"{inp.get('name')}\"]")
+                                    for form in html_data.get('forms', []):
+                                        for inp in form.get('inputs', []):
+                                            if inp.get('name'):
+                                                available_inputs.append(f"input[name=\"{inp.get('name')}\"]")
+                                    if available_inputs:
+                                        print(f"       Available email/subscribe inputs: {', '.join(available_inputs[:5])}")
+                                # Still include it but mark for retry during execution
+                                validated_selectors[step_key] = selector_info
+                
+                # Execute actions based on LLM-extracted selectors
+                step_num = 0
+                total_actions = len(validated_selectors)
+                if self.current_execution_progress:
+                    self.current_execution_progress['total_steps'] = total_actions
+                
+                for step_idx, step in enumerate(test_case.steps, 1):
+                    step_key = f"step_{step_idx}"
+                    if step_key in validated_selectors:
+                        selector_info = validated_selectors[step_key]
+                        action = selector_info.get('action', '').lower()
+                        selector = selector_info.get('selector', '')
+                        value = selector_info.get('value', '')
+                        
+                        # Normalize and validate selector
+                        selector = self._normalize_llm_selector(selector)
+                        if not selector:
+                            print(f"    ⚠️  Skipping step {step_idx}: Invalid or skipped selector")
+                            continue
+                        
+                        # Skip fields that shouldn't be filled (CSRF tokens, hidden fields)
+                        if self._should_skip_field(selector, action):
+                            print(f"    ⚠️  Skipping step {step_idx}: CSRF token or hidden field ({selector})")
+                            continue
+                        
+                        if action == 'navigate' and test_url:
+                            step_num += 1
+                            step_desc = f"Navigate to {test_url}"
+                            print(f"  → {step_desc}")
+                            
+                            result = self.browser_controller.navigate_to(test_url)
+                            step_result = {
+                                'step_number': step_num,
+                                'description': step_desc,
+                                'status': 'passed' if result.get('success') else 'failed',
+                                'timestamp': datetime.now(timezone.utc).isoformat()
+                            }
+                            
+                            if not result.get('success'):
+                                execution_result['status'] = 'failed'
+                                step_result['error'] = result.get('error', 'Navigation failed')
+                                execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                            
+                            sleep(0.5)
+                            screenshot = self.browser_controller.capture_screenshot(update_latest=True)
+                            if screenshot:
+                                execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                            
+                            if self.current_execution_progress:
+                                self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                            
+                            execution_result['steps'].append(step_result)
+                            sleep(1)
+                        
+                        elif action == 'fill' and selector:
+                            step_num += 1
+                            
+                            # Try to extract actual value from generated code first
+                            # This ensures we use values like 'testUser@gmail.com' from the code
+                            # instead of generic LLM values like 'valid email data'
+                            code_value = None
+                            if hasattr(self, '_current_test_code') and self._current_test_code:
+                                code_value = self._extract_value_from_code(self._current_test_code, selector)
+                            
+                            # Use code value if found, otherwise use LLM value, otherwise use default
+                            raw_value = code_value or value or "test_data"
+                            
+                            # Generate proper test data if the value is a placeholder/description
+                            final_value = self._generate_test_data(raw_value, selector)
+                            
+                            step_desc = f"Fill {selector} with {final_value}"
+                            print(f"  → {step_desc}")
+                            
+                            try:
+                                wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                                if wait_result.get('success'):
+                                    result = self.browser_controller.type_text(selector, final_value)
+                                    step_result = {
+                                        'step_number': step_num,
+                                        'description': step_desc,
+                                        'status': 'passed' if result.get('success') else 'failed',
+                                        'timestamp': datetime.now(timezone.utc).isoformat()
+                                    }
+                                    
+                                    if not result.get('success'):
+                                        execution_result['status'] = 'failed'
+                                        step_result['error'] = result.get('error', 'Fill failed')
+                                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                    
+                                    screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
+                                    if screenshot:
+                                        execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                    
+                                    if self.current_execution_progress:
+                                        self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                    
+                                    execution_result['steps'].append(step_result)
+                                    sleep(0.3)
+                                else:
+                                    # Try alternative selector as fallback
+                                    alt_selector = self._find_alternative_selector(selector, html_data, action)
+                                    if alt_selector:
+                                        print(f"    🔄 Trying alternative selector: {alt_selector}")
+                                        wait_result_alt = self.browser_controller.wait_for_selector(alt_selector, timeout=5000)
+                                        if wait_result_alt.get('success'):
+                                            result = self.browser_controller.type_text(alt_selector, final_value)
+                                            step_desc = f"Fill {alt_selector} with {final_value}"
+                                            step_result = {
+                                                'step_number': step_num,
+                                                'description': step_desc,
+                                                'status': 'passed' if result.get('success') else 'failed',
+                                                'timestamp': datetime.now(timezone.utc).isoformat(),
+                                                'note': f'Used alternative selector (original: {selector})'
+                                            }
+                                            
+                                            if not result.get('success'):
+                                                execution_result['status'] = 'failed'
+                                                step_result['error'] = result.get('error', 'Fill failed')
+                                                execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                            
+                                            screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
+                                            if screenshot:
+                                                execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                            
+                                            if self.current_execution_progress:
+                                                self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                            
+                                            execution_result['steps'].append(step_result)
+                                            sleep(0.3)
+                                            continue
+                                    
+                                    print(f"    ⚠️  Element not found: {selector}")
+                                    step_result = {
+                                        'step_number': step_num,
+                                        'description': step_desc,
+                                        'status': 'failed',
+                                        'error': f"Element not found: {selector}",
+                                        'timestamp': datetime.now(timezone.utc).isoformat()
+                                    }
+                                    execution_result['status'] = 'failed'
+                                    execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                    execution_result['steps'].append(step_result)
+                            except Exception as e:
+                                print(f"    ❌ Error: {e}")
+                                execution_result['status'] = 'failed'
+                                execution_result['errors'].append({'step': step_num, 'error': str(e)})
+                        
+                        elif action == 'click' and selector:
+                            step_num += 1
+                            step_desc = f"Click {selector}"
+                            print(f"  → {step_desc}")
+                            
+                            try:
+                                wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                                if wait_result.get('success'):
+                                    result = self.browser_controller.click_element(selector)
+                                    step_result = {
+                                        'step_number': step_num,
+                                        'description': step_desc,
+                                        'status': 'passed' if result.get('success') else 'failed',
+                                        'timestamp': datetime.now(timezone.utc).isoformat()
+                                    }
+                                    
+                                    if not result.get('success'):
+                                        execution_result['status'] = 'failed'
+                                        step_result['error'] = result.get('error', 'Click failed')
+                                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                    
+                                    sleep(0.5)
+                                    screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
+                                    if screenshot:
+                                        execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                    
+                                    if self.current_execution_progress:
+                                        self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                    
+                                    execution_result['steps'].append(step_result)
+                                    sleep(1)
+                                else:
+                                    print(f"    ⚠️  Element not found: {selector}")
+                                    step_result = {
+                                        'step_number': step_num,
+                                        'description': step_desc,
+                                        'status': 'failed',
+                                        'error': f"Element not found: {selector}",
+                                        'timestamp': datetime.now(timezone.utc).isoformat()
+                                    }
+                                    execution_result['status'] = 'failed'
+                                    execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                    execution_result['steps'].append(step_result)
+                            except Exception as e:
+                                print(f"    ❌ Error: {e}")
+                                execution_result['status'] = 'failed'
+                                execution_result['errors'].append({'step': step_num, 'error': str(e)})
+                        
+                        elif action == 'wait' and selector:
+                            step_num += 1
+                            step_desc = f"Wait for {selector}"
+                            print(f"  → {step_desc}")
+                            
+                            try:
+                                result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                                step_result = {
+                                    'step_number': step_num,
+                                    'description': step_desc,
+                                    'status': 'passed' if result.get('success') else 'failed',
+                                    'timestamp': datetime.now(timezone.utc).isoformat()
+                                }
+                                
+                                if not result.get('success'):
+                                    step_result['error'] = result.get('error', 'Element not found')
+                                    execution_result['status'] = 'failed'
+                                    execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                    print(f"    ⚠️  {step_result['error']}")
+                                
+                                screenshot = self.browser_controller.capture_screenshot(update_latest=True)
+                                if screenshot:
+                                    execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                
+                                if self.current_execution_progress:
+                                    self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                
+                                execution_result['steps'].append(step_result)
+                            except Exception as e:
+                                print(f"    ❌ Error: {e}")
+                                execution_result['status'] = 'failed'
+                                execution_result['errors'].append({'step': step_num, 'error': str(e)})
+                                step_num -= 1
+                                continue
+                
+                if step_num > 0:
+                    print(f"✅ Executed {step_num} actions using LLM-extracted selectors")
+                    # Final status check
+                    failed_steps = [s for s in execution_result.get('steps', []) if s.get('status') == 'failed']
+                    if failed_steps:
+                        execution_result['status'] = 'failed'
+                        print(f"❌ Test failed: {len(failed_steps)} step(s) failed")
+                    elif execution_result.get('errors'):
+                        execution_result['status'] = 'failed'
+                        print(f"❌ Test failed: {len(execution_result['errors'])} error(s) occurred")
+                    else:
+                        print(f"✅ Test passed: All steps completed successfully")
+                    
+                    execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
+                    return execution_result
+            else:
+                print(f"   ⚠️  LLM extraction failed, falling back to regex extraction")
+            
+            # STEP 2: Fall back to regex extraction from generated code
+            print(f"🔍 Trying regex-based selector extraction from generated code...")
+            # Extract actions from the Python code using regex
             # Look for common Playwright patterns: page.goto, page.fill, page.click, page.wait_for_selector
             
             # Extract navigation (handle both page.goto and await page.goto)
@@ -3531,13 +4353,16 @@ Only return the JSON, no other text:"""
                         attr, value = sel.split('=', 1)
                         # Remove quotes if present
                         value = value.strip('"\'')
+                        # Skip if value is empty (invalid selector)
+                        if not value:
+                            return None
                         return f'[{attr}="{value}"]'
                 return sel
             
-            # Normalize all selectors
-            fill_matches = [(normalize_selector(sel), val) for sel, val in fill_matches]
-            click_matches = [normalize_selector(sel) for sel in click_matches]
-            wait_matches = [normalize_selector(sel) for sel in wait_matches]
+            # Normalize all selectors (filter out None results from invalid selectors)
+            fill_matches = [(normalize_selector(sel), val) for sel, val in fill_matches if normalize_selector(sel) is not None]
+            click_matches = [normalize_selector(sel) for sel in click_matches if normalize_selector(sel) is not None]
+            wait_matches = [normalize_selector(sel) for sel in wait_matches if normalize_selector(sel) is not None]
             
             # Fix unicode escape sequences in text selectors
             def fix_unicode_selector(sel):
@@ -3558,15 +4383,45 @@ Only return the JSON, no other text:"""
             def is_valid_selector(sel):
                 if not sel or not sel.strip():
                     return False
+                
                 # Skip selectors ending with '=' (incomplete attribute selectors)
                 if sel.endswith('='):
                     return False
+                
                 # If it's an attribute selector starting with '[', it must end with ']'
                 if sel.startswith('[') and not sel.endswith(']'):
                     return False
+                
+                # Check for empty attribute values like [role=""] or [name=""]
+                if sel.startswith('[') and sel.endswith(']'):
+                    # Extract the attribute part
+                    attr_part = sel[1:-1]  # Remove [ and ]
+                    if '=' in attr_part:
+                        attr, value = attr_part.split('=', 1)
+                        value = value.strip('"\'')
+                        if not value:  # Empty value
+                            return False
+                
                 # Skip empty text selectors
-                if sel == 'text=' or sel.startswith('text=') and len(sel) == 5:
+                if sel == 'text=' or (sel.startswith('text=') and len(sel) == 5):
                     return False
+                
+                # Skip generic/too-broad selectors that are likely to cause issues
+                # These are valid CSS but too generic for reliable testing
+                generic_selectors = ['body', 'html', 'head', 'title', 'form', 'div', 'span', 'p', 'a', 'button', 'input']
+                if sel.lower() in generic_selectors and not sel.startswith('#') and not sel.startswith('.') and not sel.startswith('['):
+                    return False
+                
+                # Skip single-word selectors that aren't valid CSS identifiers
+                # (unless they're IDs, classes, or attributes)
+                if not sel.startswith('#') and not sel.startswith('.') and not sel.startswith('[') and not sel.startswith('text='):
+                    # Check if it's a valid tag name (but we already filtered generic ones)
+                    # Allow specific tag selectors like 'input[type="text"]' but not just 'title'
+                    if ' ' not in sel and '>' not in sel and '+' not in sel and '~' not in sel:
+                        # This might be a tag name, but we want to be conservative
+                        # Only allow if it's part of a compound selector
+                        pass
+                
                 return True
             
             wait_matches = [s for s in wait_matches if is_valid_selector(s)]
@@ -3649,7 +4504,9 @@ Only return the JSON, no other text:"""
                     
                     if not result.get('success'):
                         step_result['error'] = result.get('error', 'Element not found')
-                        # Don't fail the test for wait timeouts, just log it
+                        # Mark test as failed if wait fails (wait failures are usually critical)
+                        execution_result['status'] = 'failed'
+                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
                         print(f"    ⚠️  {step_result['error']}")
                     
                     screenshot = self.browser_controller.capture_screenshot(update_latest=True)
@@ -3662,6 +4519,8 @@ Only return the JSON, no other text:"""
                     execution_result['steps'].append(step_result)
                 except Exception as e:
                     print(f"    ❌ Error waiting for {selector}: {e}")
+                    execution_result['status'] = 'failed'
+                    execution_result['errors'].append({'step': step_num, 'error': str(e)})
                     # Skip invalid selectors
                     step_num -= 1  # Don't count this as a step
                     continue
@@ -3674,7 +4533,11 @@ Only return the JSON, no other text:"""
                     continue
                 
                 step_num += 1
-                step_desc = f"Fill {selector[:50]} with {value[:30] if value else 'data'}"
+                
+                # Generate proper test data if the value is a placeholder/description
+                final_value = self._generate_test_data(value if value else "test_data", selector)
+                
+                step_desc = f"Fill {selector[:50]} with {final_value[:30]}"
                 print(f"  → {step_desc}")
                 
                 try:
@@ -3695,7 +4558,7 @@ Only return the JSON, no other text:"""
                         continue
                     
                     # type_text already uses page.fill() internally, so this is correct
-                    result = self.browser_controller.type_text(selector, value if value else "test_data")
+                    result = self.browser_controller.type_text(selector, final_value)
                     step_result = {
                         'step_number': step_num,
                         'description': step_desc,
@@ -3788,188 +4651,10 @@ Only return the JSON, no other text:"""
                     step_num -= 1  # Don't count this as a step
                     continue
             
-            # If no actions were found, try LLM-based selector extraction first
+            # If no actions were found from regex, try basic step-based execution
             if step_num == 0:
-                print(f"⚠️  No Playwright actions found in code, trying LLM-based selector extraction")
+                print(f"⚠️  No Playwright actions found in code via regex, trying basic step-based execution")
                 print(f"   Code snippet (first 500 chars): {test_code[:500]}")
-                
-                # Try to extract selectors using LLM analysis of page HTML
-                llm_selectors = self._extract_selectors_using_llm(test_case, test_case.url or '')
-                if llm_selectors.get('success') and llm_selectors.get('selectors'):
-                    print(f"   ✓ LLM extracted {len(llm_selectors['selectors'])} selectors from page HTML")
-                    selectors = llm_selectors['selectors']
-                    
-                    # Execute actions based on LLM-extracted selectors
-                    for step_idx, step in enumerate(test_case.steps, 1):
-                        step_key = f"step_{step_idx}"
-                        if step_key in selectors:
-                            selector_info = selectors[step_key]
-                            action = selector_info.get('action', '').lower()
-                            selector = selector_info.get('selector', '')
-                            value = selector_info.get('value', '')
-                            
-                            if action == 'navigate' and test_case.url:
-                                step_num += 1
-                                step_desc = f"Navigate to {test_case.url}"
-                                print(f"  → {step_desc}")
-                                
-                                result = self.browser_controller.navigate_to(test_case.url)
-                                step_result = {
-                                    'step_number': step_num,
-                                    'description': step_desc,
-                                    'status': 'passed' if result.get('success') else 'failed',
-                                    'timestamp': datetime.now(timezone.utc).isoformat()
-                                }
-                                
-                                if not result.get('success'):
-                                    execution_result['status'] = 'failed'
-                                    step_result['error'] = result.get('error', 'Navigation failed')
-                                    execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
-                                
-                                sleep(0.5)
-                                screenshot = self.browser_controller.capture_screenshot(update_latest=True)
-                                if screenshot:
-                                    execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
-                                
-                                if self.current_execution_progress:
-                                    self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
-                                
-                                execution_result['steps'].append(step_result)
-                                sleep(1)
-                            
-                            elif action == 'fill' and selector:
-                                step_num += 1
-                                step_desc = f"Fill {selector} with {value or 'test data'}"
-                                print(f"  → {step_desc}")
-                                
-                                try:
-                                    wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
-                                    if wait_result.get('success'):
-                                        result = self.browser_controller.type_text(selector, value or "test_data")
-                                        step_result = {
-                                            'step_number': step_num,
-                                            'description': step_desc,
-                                            'status': 'passed' if result.get('success') else 'failed',
-                                            'timestamp': datetime.now(timezone.utc).isoformat()
-                                        }
-                                        
-                                        if not result.get('success'):
-                                            execution_result['status'] = 'failed'
-                                            step_result['error'] = result.get('error', 'Fill failed')
-                                            execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
-                                        
-                                        screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
-                                        if screenshot:
-                                            execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
-                                        
-                                        if self.current_execution_progress:
-                                            self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
-                                        
-                                        execution_result['steps'].append(step_result)
-                                        sleep(0.3)
-                                    else:
-                                        print(f"    ⚠️  Element not found: {selector}")
-                                        step_result = {
-                                            'step_number': step_num,
-                                            'description': step_desc,
-                                            'status': 'failed',
-                                            'error': f"Element not found: {selector}",
-                                            'timestamp': datetime.now(timezone.utc).isoformat()
-                                        }
-                                        execution_result['status'] = 'failed'
-                                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
-                                        execution_result['steps'].append(step_result)
-                                except Exception as e:
-                                    print(f"    ❌ Error: {e}")
-                                    execution_result['status'] = 'failed'
-                                    execution_result['errors'].append({'step': step_num, 'error': str(e)})
-                            
-                            elif action == 'click' and selector:
-                                step_num += 1
-                                step_desc = f"Click {selector}"
-                                print(f"  → {step_desc}")
-                                
-                                try:
-                                    wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
-                                    if wait_result.get('success'):
-                                        result = self.browser_controller.click_element(selector)
-                                        step_result = {
-                                            'step_number': step_num,
-                                            'description': step_desc,
-                                            'status': 'passed' if result.get('success') else 'failed',
-                                            'timestamp': datetime.now(timezone.utc).isoformat()
-                                        }
-                                        
-                                        if not result.get('success'):
-                                            execution_result['status'] = 'failed'
-                                            step_result['error'] = result.get('error', 'Click failed')
-                                            execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
-                                        
-                                        sleep(0.5)
-                                        screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
-                                        if screenshot:
-                                            execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
-                                        
-                                        if self.current_execution_progress:
-                                            self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
-                                        
-                                        execution_result['steps'].append(step_result)
-                                        sleep(1)
-                                    else:
-                                        print(f"    ⚠️  Element not found: {selector}")
-                                        step_result = {
-                                            'step_number': step_num,
-                                            'description': step_desc,
-                                            'status': 'failed',
-                                            'error': f"Element not found: {selector}",
-                                            'timestamp': datetime.now(timezone.utc).isoformat()
-                                        }
-                                        execution_result['status'] = 'failed'
-                                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
-                                        execution_result['steps'].append(step_result)
-                                except Exception as e:
-                                    print(f"    ❌ Error: {e}")
-                                    execution_result['status'] = 'failed'
-                                    execution_result['errors'].append({'step': step_num, 'error': str(e)})
-                            
-                            elif action == 'wait' and selector:
-                                step_num += 1
-                                step_desc = f"Wait for {selector}"
-                                print(f"  → {step_desc}")
-                                
-                                try:
-                                    result = self.browser_controller.wait_for_selector(selector, timeout=5000)
-                                    step_result = {
-                                        'step_number': step_num,
-                                        'description': step_desc,
-                                        'status': 'passed' if result.get('success') else 'failed',
-                                        'timestamp': datetime.now(timezone.utc).isoformat()
-                                    }
-                                    
-                                    if not result.get('success'):
-                                        step_result['error'] = result.get('error', 'Element not found')
-                                        print(f"    ⚠️  {step_result['error']}")
-                                    
-                                    screenshot = self.browser_controller.capture_screenshot(update_latest=True)
-                                    if screenshot:
-                                        execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
-                                    
-                                    if self.current_execution_progress:
-                                        self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
-                                    
-                                    execution_result['steps'].append(step_result)
-                                except Exception as e:
-                                    print(f"    ❌ Error: {e}")
-                                    step_num -= 1
-                                    continue
-                    
-                    if step_num > 0:
-                        print(f"✅ Executed {step_num} actions using LLM-extracted selectors")
-                        execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
-                        return execution_result
-                
-                # Fallback to basic step-based execution if LLM extraction also fails
-                print(f"   ⚠️  LLM extraction failed, falling back to basic step execution")
                 
                 # Try to extract actions from test case steps
                 for step in test_case.steps:
@@ -4058,7 +4743,17 @@ Only return the JSON, no other text:"""
                 execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
                 return execution_result
             
-            print(f"✅ Executed {step_num} actions from generated code")
+            # Final status check: if any steps failed, mark test as failed
+            failed_steps = [s for s in execution_result.get('steps', []) if s.get('status') == 'failed']
+            if failed_steps:
+                execution_result['status'] = 'failed'
+                print(f"❌ Test failed: {len(failed_steps)} step(s) failed")
+            elif execution_result.get('errors'):
+                # If there are errors but no failed steps, still mark as failed
+                execution_result['status'] = 'failed'
+                print(f"❌ Test failed: {len(execution_result['errors'])} error(s) occurred")
+            else:
+                print(f"✅ Executed {step_num} actions from generated code - Test passed")
             
         except Exception as e:
             error_str = str(e)
@@ -4082,6 +4777,18 @@ Only return the JSON, no other text:"""
                 return result
             except:
                 pass
+        
+        # Final status check: if any steps failed or errors occurred, mark test as failed
+        failed_steps = [s for s in execution_result.get('steps', []) if s.get('status') == 'failed']
+        if failed_steps:
+            execution_result['status'] = 'failed'
+            print(f"❌ Test failed: {len(failed_steps)} step(s) failed")
+        elif execution_result.get('errors'):
+            # If there are errors but no failed steps, still mark as failed
+            execution_result['status'] = 'failed'
+            print(f"❌ Test failed: {len(execution_result['errors'])} error(s) occurred")
+        elif execution_result.get('status') == 'passed':
+            print(f"✅ Test passed: All steps completed successfully")
         
         execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
         return execution_result

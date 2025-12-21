@@ -114,6 +114,27 @@ def create_chat_routes(llm_agent):
         """Reset the agent to initial state"""
         try:
             result = llm_agent.reset_agent()
+            
+            # Also reset global metrics data
+            try:
+                from routes.metrics_routes import metrics_data
+                metrics_data.update({
+                    'testsRun': 0,
+                    'testsPassed': 0,
+                    'testsFailed': 0,
+                    'executionTime': 0,
+                    'coverage': 0,
+                    'averageResponseTime': 0,
+                    'tokensConsumed': 0,
+                    'average_response_time': 0,
+                    'total_tokens_consumed': 0,
+                    'total_requests': 0,
+                    'response_times': [],
+                    'errors': []
+                })
+            except Exception as metrics_error:
+                print(f"Warning: Could not reset metrics: {metrics_error}")
+            
             return jsonify({
                 'text': result.get('message', 'Agent reset successfully'),
                 'message': result.get('message', 'Agent reset successfully'),

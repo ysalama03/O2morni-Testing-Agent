@@ -8,26 +8,51 @@ const BrowserView = ({ screenshot, url, loading = false, executionProgress = nul
   const [displayScreenshot, setDisplayScreenshot] = useState(screenshot);
   const [isImageLoading, setIsImageLoading] = useState(false);
 
+  // Get the best available screenshot (from prop or execution progress)
+  const getBestScreenshot = () => {
+    // First priority: screenshot from props (browser state)
+    if (screenshot) {
+      return screenshot;
+    }
+    
+    // Second priority: latest screenshot from execution progress steps
+    if (executionProgress && executionProgress.steps) {
+      const stepsWithScreenshots = executionProgress.steps
+        .filter(step => step.screenshot)
+        .sort((a, b) => (b.step_number || 0) - (a.step_number || 0));
+      if (stepsWithScreenshots.length > 0) {
+        return stepsWithScreenshots[0].screenshot;
+      }
+    }
+    
+    return null;
+  };
+
+  const bestScreenshot = getBestScreenshot();
+
   // Update displayed screenshot only when a new one is provided
   // This prevents flickering during polling
   useEffect(() => {
-    if (screenshot) {
+    if (bestScreenshot) {
       // Only update if it's actually a different screenshot
-      if (screenshot !== displayScreenshot) {
+      if (bestScreenshot !== displayScreenshot) {
         setIsImageLoading(true);
         // Preload the new image before switching
         const img = new Image();
         img.onload = () => {
-          setDisplayScreenshot(screenshot);
+          setDisplayScreenshot(bestScreenshot);
           setIsImageLoading(false);
         };
         img.onerror = () => {
           setIsImageLoading(false);
         };
-        img.src = screenshot;
+        img.src = bestScreenshot;
       }
+    } else if (displayScreenshot && !bestScreenshot) {
+      // Clear screenshot if it's no longer available
+      setDisplayScreenshot(null);
     }
-  }, [screenshot, displayScreenshot]);
+  }, [bestScreenshot, displayScreenshot]);
 
   // Get status emoji and color
   const getStepStatusIcon = (status) => {
