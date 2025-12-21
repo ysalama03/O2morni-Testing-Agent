@@ -65,7 +65,8 @@ class BrowserController:
             self._thread_id = self._initialized_thread
             
             self.playwright = sync_playwright().start()
-            headless = os.environ.get('HEADLESS', 'true').lower() != 'false'
+            # Default to visible browser (headless=False) so user can see the work happening in real-time
+            headless = os.environ.get('HEADLESS', 'false').lower() == 'true'
             
             self.browser = self.playwright.chromium.launch(
                 headless=headless,
@@ -380,18 +381,28 @@ class BrowserController:
                 return {'success': False, 'error': str(e)}
     
     def start_video_recording(self, video_path: str) -> Dict:
-        """Start video recording for test execution"""
+        """
+        Start video recording for test execution.
+        Creates a new context with video recording and uses it for the main page.
+        This ensures all test actions are recorded on the visible browser.
+        """
         with self._lock:
             try:
                 if not self.browser:
                     return {'success': False, 'error': 'Browser not initialized'}
                 
-                # Create a new context with video recording enabled
                 video_dir = os.path.dirname(video_path)
                 os.makedirs(video_dir, exist_ok=True)
                 
-                # Playwright requires record_video_dir (directory) not a specific file path
-                # It will generate a filename automatically
+                # Save current URL to restore it
+                current_url = None
+                if self.page:
+                    try:
+                        current_url = self.page.url
+                    except:
+                        pass
+                
+                # Create a new context with video recording enabled
                 self._video_context = self.browser.new_context(
                     viewport={'width': 1280, 'height': 720},
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -402,16 +413,22 @@ class BrowserController:
                 # Create a new page in the video context
                 video_page = self._video_context.new_page()
                 
-                # Copy current page state to video page
-                if self.page:
+                # Navigate to current URL if available
+                if current_url and current_url != 'about:blank':
                     try:
-                        current_url = self.page.url
-                        if current_url and current_url != 'about:blank':
-                            video_page.goto(current_url, wait_until='networkidle', timeout=30000)
+                        video_page.goto(current_url, wait_until='networkidle', timeout=30000)
                     except:
                         pass  # Don't fail if navigation fails
                 
+                # Replace main context and page with video recording ones
+                # Store old context/page for restoration later
+                self._old_context = self.context
+                self._old_page = self.page
+                self.context = self._video_context
+                self.page = video_page
+                
                 self._video_path = video_path
+                print(f"Video recording started: {video_path}")
                 return {
                     'success': True,
                     'video_path': video_path,
@@ -440,8 +457,45 @@ class BrowserController:
                     except:
                         pass
                     
+                    # Get current URL before closing
+                    current_url = None
+                    if self.page:
+                        try:
+                            current_url = self.page.url
+                        except:
+                            pass
+                    
                     # Close video context to finalize video
                     self._video_context.close()
+                    
+                    # Restore original context and page
+                    if hasattr(self, '_old_context') and self._old_context:
+                        self.context = self._old_context
+                        self.page = self._old_page
+                        delattr(self, '_old_context')
+                        delattr(self, '_old_page')
+                    else:
+                        # Create a new context without video for continued use
+                        try:
+                            self.context = self.browser.new_context(
+                                viewport={'width': 1280, 'height': 720},
+                                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                            )
+                            self.page = self.context.new_page()
+                            # Navigate to current URL if available
+                            if current_url and current_url != 'about:blank':
+                                try:
+                                    self.page.goto(current_url, wait_until='networkidle', timeout=30000)
+                                except:
+                                    pass
+                        except Exception as e:
+                            print(f"Warning: Could not restore context: {e}")
+                            # Create a basic new context
+                            self.context = self.browser.new_context(
+                                viewport={'width': 1280, 'height': 720},
+                                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                            )
+                            self.page = self.context.new_page()
                     
                     # Playwright saves video with a generated name, we need to find and rename it
                     import glob
@@ -469,6 +523,7 @@ class BrowserController:
                             final_path = self._video_path if os.path.exists(self._video_path) else source_video
                             self._video_context = None
                             self._video_path = None
+                            print(f"Video recording stopped: {final_path}")
                             return final_path
                     
                     self._video_context = None

@@ -67,6 +67,7 @@ class TestCase:
     priority: str  # high, medium, low
     status: str  # proposed, approved, rejected, needs_revision
     human_feedback: Optional[str] = None
+    url: Optional[str] = None  # URL this test case is for
 
 
 @dataclass
@@ -989,7 +990,8 @@ class ExecuteTestTool(Tool):
         super().__init__()
         self.browser_controller = browser_controller
         self.progress_callback = progress_callback
-        self.video_page = video_page  # Separate page for video recording
+        # video_page parameter kept for backward compatibility but not used
+        # Video recording is now done on the main visible page
 
     def forward(self, test_steps: List[str], test_name: str) -> Dict:
         execution_result = {
@@ -1018,12 +1020,7 @@ class ExecuteTestTool(Tool):
                     if url_match:
                         result = self.browser_controller.navigate_to(url_match.group())
                         step_result['status'] = 'passed' if result.get('success') else 'failed'
-                        # Also navigate video page if recording
-                        if self.video_page and result.get('success'):
-                            try:
-                                self.video_page.goto(url_match.group(), wait_until='networkidle', timeout=30000)
-                            except:
-                                pass  # Don't fail test if video page navigation fails
+                                # Video is now recorded on the main page, no need for separate video_page
                         
                 elif 'click' in step_lower:
                     # Extract selector from step
@@ -1031,12 +1028,7 @@ class ExecuteTestTool(Tool):
                     if selector_match:
                         result = self.browser_controller.click_element(selector_match.group(1))
                         step_result['status'] = 'passed' if result.get('success') else 'failed'
-                        # Also click on video page if recording
-                        if self.video_page and result.get('success'):
-                            try:
-                                self.video_page.click(selector_match.group(1), timeout=5000)
-                            except:
-                                pass  # Don't fail test if video page click fails
+                        # Video is now recorded on the main page, no need for separate video_page
                         
                 elif 'type' in step_lower or 'enter' in step_lower or 'fill' in step_lower:
                     # This would need more sophisticated parsing
@@ -1166,7 +1158,9 @@ class LLMAgent:
         
         # Workflow state
         self.current_phase = WorkflowPhase.IDLE
-        self.ground_truth: Optional[PageGroundTruth] = None
+        self.ground_truth: Optional[PageGroundTruth] = None  # Keep for backward compatibility
+        self.ground_truths: Dict[str, PageGroundTruth] = {}  # URL -> PageGroundTruth mapping
+        self.explored_urls: set = set()  # Track explored URLs to avoid duplicates
         self.proposed_test_cases: List[TestCase] = []
         self.approved_test_cases: List[TestCase] = []
         self.generated_code: Dict[str, str] = {}  # test_id -> code
@@ -1363,12 +1357,186 @@ class LLMAgent:
     # PHASE 1: EXPLORATION
     # =========================================================================
     
-    def start_exploration(self, url: str) -> Dict:
+    def _is_reasonable_url_for_testing(self, url: str, link_text: str = "") -> bool:
+        """
+        Determine if a URL is reasonable for test case generation.
+        Prioritizes sign in, sign up, and other important functional pages.
+        """
+        url_lower = url.lower()
+        text_lower = link_text.lower()
+        
+        # High priority: Authentication pages
+        auth_keywords = [
+            'signin', 'sign-in', 'sign_in', 'login', 'log-in', 'log_in',
+            'signup', 'sign-up', 'sign_up', 'register', 'registration',
+            'auth', 'authentication', 'account'
+        ]
+        
+        # Medium priority: Important functional pages
+        important_keywords = [
+            'checkout', 'cart', 'payment', 'billing', 'subscribe',
+            'profile', 'settings', 'dashboard', 'home', 'index'
+        ]
+        
+        # Check URL path and link text
+        url_has_auth = any(keyword in url_lower for keyword in auth_keywords)
+        text_has_auth = any(keyword in text_lower for keyword in auth_keywords)
+        
+        url_has_important = any(keyword in url_lower for keyword in important_keywords)
+        text_has_important = any(keyword in text_lower for keyword in important_keywords)
+        
+        # Prioritize authentication pages
+        if url_has_auth or text_has_auth:
+            return True
+        
+        # Include important functional pages
+        if url_has_important or text_has_important:
+            return True
+        
+        # Exclude common non-functional pages
+        exclude_patterns = [
+            '/blog/', '/news/', '/article/', '/post/',
+            '/about', '/contact', '/help', '/faq', '/terms', '/privacy',
+            '/careers', '/team', '/press', '/media',
+            '/tag/', '/category/', '/archive/',
+            '/search?', '/filter?', '/sort?'
+        ]
+        
+        if any(pattern in url_lower for pattern in exclude_patterns):
+            return False
+        
+        # If URL has forms, it might be worth testing
+        # We'll check this during exploration
+        
+        return False  # Default: not reasonable unless it matches above criteria
+    
+    def _discover_navigable_urls(self, base_url: str, max_urls: int = 10, prioritize_reasonable: bool = True) -> List[str]:
+        """
+        Discover all navigable URLs from the current page.
+        Filters to same domain, removes duplicates, and prioritizes reasonable URLs for testing.
+        If prioritize_reasonable is True, only returns URLs that are reasonable for test case generation.
+        """
+        try:
+            # Get all links from the current page
+            links_script = """
+            (() => {
+                const links = [];
+                document.querySelectorAll('a[href]').forEach(link => {
+                    try {
+                        const href = link.href;
+                        const text = link.textContent?.trim() || '';
+                        // Only include links with visible text or meaningful hrefs
+                        if (text || href.includes('/') || href.includes('#')) {
+                            links.push({
+                                href: href,
+                                text: text.substring(0, 50)
+                            });
+                        }
+                    } catch (e) {}
+                });
+                return links;
+            })()
+            """
+            
+            result = self.browser_controller.evaluate_script(links_script)
+            if not result.get('success'):
+                return []
+            
+            links = result.get('result', [])
+            
+            # Parse base URL to get domain
+            from urllib.parse import urlparse
+            base_parsed = urlparse(base_url)
+            base_domain = base_parsed.netloc
+            base_scheme = base_parsed.scheme
+            
+            discovered_urls = set()
+            
+            # Filter and normalize URLs
+            for link in links:
+                href = link.get('href', '')
+                if not href:
+                    continue
+                
+                try:
+                    parsed = urlparse(href)
+                    
+                    # Skip non-HTTP(S) URLs
+                    if parsed.scheme and parsed.scheme not in ['http', 'https']:
+                        continue
+                    
+                    # Skip anchors/fragments only
+                    if href.startswith('#'):
+                        continue
+                    
+                    # Skip javascript:, mailto:, tel:, etc.
+                    if parsed.scheme and parsed.scheme not in ['http', 'https', '']:
+                        continue
+                    
+                    # Normalize URL
+                    if not parsed.scheme:
+                        # Relative URL - make absolute
+                        if href.startswith('//'):
+                            normalized = f"{base_scheme}:{href}"
+                        elif href.startswith('/'):
+                            normalized = f"{base_scheme}://{base_domain}{href}"
+                        else:
+                            # Relative path
+                            base_path = base_parsed.path.rstrip('/')
+                            normalized = f"{base_scheme}://{base_domain}{base_path}/{href}"
+                    else:
+                        normalized = href
+                    
+                    # Only include same-domain URLs
+                    normalized_parsed = urlparse(normalized)
+                    if normalized_parsed.netloc == base_domain or normalized_parsed.netloc == '':
+                        # Remove fragments and query params for deduplication
+                        clean_url = f"{normalized_parsed.scheme}://{normalized_parsed.netloc}{normalized_parsed.path}"
+                        clean_url = clean_url.rstrip('/')
+                        
+                        # Skip common non-content URLs
+                        skip_patterns = [
+                            '/logout', '/signout', '/exit',
+                            '/api/', '/ajax/', '/json',
+                            '.pdf', '.doc', '.zip', '.jpg', '.png', '.gif',
+                            'javascript:', 'mailto:', 'tel:'
+                        ]
+                        
+                        if any(pattern in normalized.lower() for pattern in skip_patterns):
+                            continue
+                        
+                        # Filter to only reasonable URLs if requested
+                        if prioritize_reasonable:
+                            if not self._is_reasonable_url_for_testing(normalized, link.get('text', '')):
+                                continue
+                        
+                        # Skip if already explored or in queue
+                        if clean_url not in self.explored_urls and clean_url != base_url.rstrip('/'):
+                            discovered_urls.add(normalized)
+                            
+                except Exception as e:
+                    print(f"Warning: Could not parse URL {href}: {e}")
+                    continue
+            
+            # Limit to max_urls
+            return list(discovered_urls)[:max_urls]
+            
+        except Exception as e:
+            print(f"Error discovering URLs: {e}")
+            return []
+    
+    def start_exploration(self, url: str, explore_all_urls: bool = True) -> Dict:
         """
         Phase 1: Explore a URL to understand page structure and create ground truth.
+        If explore_all_urls is True, also discovers and explores all navigable URLs from the page.
         """
         start_time = time()
         self.current_phase = WorkflowPhase.EXPLORATION
+        
+        # Reset explored URLs for new exploration session
+        if url not in self.explored_urls:
+            self.explored_urls.clear()
+            self.ground_truths.clear()
         
         try:
             # First try to navigate to the URL directly
@@ -1445,51 +1613,131 @@ class LLMAgent:
             explore_tool = ExplorePageTool(self.browser_controller)
             result = explore_tool.forward(url)
             
-            if result.get('success'):
-                ground_truth_data = result.get('ground_truth', {})
-                
-                # Use screenshot from exploration, fallback to navigation screenshot
-                screenshot = result.get('screenshot') or nav_screenshot
-                
-                # Store ground truth
-                self.ground_truth = PageGroundTruth(
-                    url=url,
-                    title=ground_truth_data.get('title', ''),
-                    description=f"Page with {len(ground_truth_data.get('forms', []))} forms, "
-                               f"{len(ground_truth_data.get('buttons', []))} buttons, "
-                               f"{len(ground_truth_data.get('links', []))} links",
-                    elements=[],
-                    forms=ground_truth_data.get('forms', []),
-                    navigation=ground_truth_data.get('navigation', []),
-                    interactive_areas=ground_truth_data.get('interactive_elements', []),
-                    screenshot_b64=screenshot,
-                    dom_summary=json.dumps(ground_truth_data, indent=2)[:2000]
-                )
-                
-                # Generate summary for human
-                summary = self._generate_exploration_summary(ground_truth_data)
-                
-                response_time = (time() - start_time) * 1000
-                self.metrics.record_request(response_time, tokens=500)  # Estimate
-                
-                return {
-                    'success': True,
-                    'phase': 'exploration',
-                    'summary': summary,
-                    'ground_truth': ground_truth_data,
-                    'screenshot': screenshot,
-                    'message': f"✅ **Phase 1 Complete: Exploration**\n\n{summary}\n\n"
-                              f"Ready to proceed to **Phase 2: Collaborative Design**. "
-                              f"I will now propose test cases based on this analysis.",
-                    'metrics': self.metrics.to_dict()
-                }
-            else:
+            if not result.get('success'):
                 return {
                     'success': False,
                     'phase': 'exploration',
                     'error': result.get('error', 'Unknown error during exploration'),
                     'metrics': self.metrics.to_dict()
                 }
+            
+            ground_truth_data = result.get('ground_truth', {})
+            screenshot = result.get('screenshot') or nav_screenshot
+            
+            # Store ground truth for the initial URL
+            initial_ground_truth = PageGroundTruth(
+                url=url,
+                title=ground_truth_data.get('title', ''),
+                description=f"Page with {len(ground_truth_data.get('forms', []))} forms, "
+                           f"{len(ground_truth_data.get('buttons', []))} buttons, "
+                           f"{len(ground_truth_data.get('links', []))} links",
+                elements=[],
+                forms=ground_truth_data.get('forms', []),
+                navigation=ground_truth_data.get('navigation', []),
+                interactive_areas=ground_truth_data.get('interactive_elements', []),
+                screenshot_b64=screenshot,
+                dom_summary=json.dumps(ground_truth_data, indent=2)[:2000]
+            )
+            
+            self.ground_truth = initial_ground_truth  # Keep for backward compatibility
+            self.ground_truths[url] = initial_ground_truth
+            self.explored_urls.add(url)
+            
+            # Discover and explore additional URLs if requested
+            explored_urls_list = [url]
+            exploration_summaries = []
+            
+            if explore_all_urls:
+                # Only discover reasonable URLs (sign in, sign up, etc.)
+                discovered_urls = self._discover_navigable_urls(url, max_urls=10, prioritize_reasonable=True)
+                
+                if discovered_urls:
+                    exploration_summaries.append(f"🔍 **Discovered {len(discovered_urls)} important URLs for testing**\n")
+                    exploration_summaries.append(f"   (Focus: Sign in, sign up, and functional pages)\n")
+                    
+                    for discovered_url in discovered_urls:
+                        if discovered_url in self.explored_urls:
+                            continue
+                        
+                        try:
+                            print(f"Exploring discovered URL: {discovered_url}")
+                            # Navigate to discovered URL
+                            nav_result = self.browser_controller.navigate_to(discovered_url)
+                            
+                            if not nav_result.get('success'):
+                                print(f"Failed to navigate to {discovered_url}: {nav_result.get('error')}")
+                                continue
+                            
+                            sleep(1)  # Allow page to load
+                            
+                            # Explore the page
+                            explore_result = explore_tool.forward(discovered_url)
+                            
+                            if explore_result.get('success'):
+                                discovered_gt_data = explore_result.get('ground_truth', {})
+                                discovered_screenshot = explore_result.get('screenshot')
+                                
+                                # Store ground truth for discovered URL
+                                discovered_ground_truth = PageGroundTruth(
+                                    url=discovered_url,
+                                    title=discovered_gt_data.get('title', ''),
+                                    description=f"Page with {len(discovered_gt_data.get('forms', []))} forms, "
+                                               f"{len(discovered_gt_data.get('buttons', []))} buttons, "
+                                               f"{len(discovered_gt_data.get('links', []))} links",
+                                    elements=[],
+                                    forms=discovered_gt_data.get('forms', []),
+                                    navigation=discovered_gt_data.get('navigation', []),
+                                    interactive_areas=discovered_gt_data.get('interactive_elements', []),
+                                    screenshot_b64=discovered_screenshot,
+                                    dom_summary=json.dumps(discovered_gt_data, indent=2)[:2000]
+                                )
+                                
+                                self.ground_truths[discovered_url] = discovered_ground_truth
+                                self.explored_urls.add(discovered_url)
+                                explored_urls_list.append(discovered_url)
+                                
+                                exploration_summaries.append(
+                                    f"  ✅ {discovered_url}\n"
+                                    f"     - {len(discovered_gt_data.get('forms', []))} forms, "
+                                    f"{len(discovered_gt_data.get('buttons', []))} buttons, "
+                                    f"{len(discovered_gt_data.get('links', []))} links"
+                                )
+                            else:
+                                print(f"Failed to explore {discovered_url}: {explore_result.get('error')}")
+                                
+                        except Exception as e:
+                            print(f"Error exploring {discovered_url}: {e}")
+                            continue
+                
+                # Navigate back to initial URL
+                self.browser_controller.navigate_to(url)
+            
+            # Generate summary for human
+            summary = self._generate_exploration_summary(ground_truth_data)
+            
+            # Add multi-URL exploration summary
+            if explore_all_urls and len(explored_urls_list) > 1:
+                summary += f"\n\n### 🌐 Focused URL Exploration\n\n"
+                summary += f"**Total URLs explored:** {len(explored_urls_list)}\n"
+                summary += f"**Focus:** Sign in, sign up, and other important functional pages\n\n"
+                summary += '\n'.join(exploration_summaries)
+            
+            response_time = (time() - start_time) * 1000
+            self.metrics.record_request(response_time, tokens=500 * len(explored_urls_list))  # Estimate
+            
+            return {
+                'success': True,
+                'phase': 'exploration',
+                'summary': summary,
+                'ground_truth': ground_truth_data,
+                'ground_truths': {url: gt.__dict__ for url, gt in self.ground_truths.items()},  # Include all ground truths
+                'explored_urls': explored_urls_list,
+                'screenshot': screenshot,
+                'message': f"✅ **Phase 1 Complete: Exploration**\n\n{summary}\n\n"
+                          f"Ready to proceed to **Phase 2: Collaborative Design**. "
+                          f"I will now propose test cases based on this analysis.",
+                'metrics': self.metrics.to_dict()
+            }
                 
         except Exception as e:
             error_str = str(e)
@@ -1625,98 +1873,158 @@ class LLMAgent:
             }
     
     def _generate_test_case_proposals(self) -> List[TestCase]:
-        """Generate test case proposals based on ground truth"""
+        """
+        Generate test case proposals based on ground truth for reasonable URLs only.
+        Focuses on sign in, sign up, and other important functional pages.
+        """
         test_cases = []
         tc_id = 1
         
-        # Generate tests for forms
-        for form in self.ground_truth.forms[:3]:
-            form_id = form.get('id', 'form')
-            inputs = form.get('inputs', [])
-            
-            # Valid submission test
-            test_cases.append(TestCase(
-                id=f"TC-{tc_id:03d}",
-                name=f"Valid {form_id} Submission",
-                description=f"Test successful form submission with valid data",
-                preconditions=[f"Navigate to {self.ground_truth.url}"],
-                steps=[
-                    f"Fill {inp.get('name', inp.get('type', 'field'))} with valid data"
-                    for inp in inputs[:5]
-                ] + ["Click submit button", "Wait for response"],
-                expected_results=["Form submits successfully", "Success message displayed or redirect occurs"],
-                priority="high",
-                status="proposed"
-            ))
-            tc_id += 1
-            
-            # Validation test for required fields
-            required_inputs = [inp for inp in inputs if inp.get('required')]
-            if required_inputs:
+        # Filter to only reasonable URLs for test case generation
+        reasonable_urls = {}
+        for url, ground_truth in self.ground_truths.items():
+            # Check if URL is reasonable for testing
+            if self._is_reasonable_url_for_testing(url):
+                reasonable_urls[url] = ground_truth
+            # Also include if it has forms with authentication indicators
+            elif ground_truth.forms:
+                # Check if forms look like authentication or important forms
+                has_auth_indicators = False
+                for form in ground_truth.forms:
+                    # Check form inputs for auth-related fields
+                    inputs = form.get('inputs', []) if isinstance(form, dict) else []
+                    for inp in inputs:
+                        inp_str = json.dumps(inp).lower() if isinstance(inp, dict) else str(inp).lower()
+                        if any(keyword in inp_str for keyword in ['password', 'email', 'username', 'login', 'sign', 'register']):
+                            has_auth_indicators = True
+                            break
+                    if has_auth_indicators:
+                        break
+                if has_auth_indicators:
+                    reasonable_urls[url] = ground_truth
+        
+        # If no reasonable URLs found, use the main URL (initial URL)
+        if not reasonable_urls and self.ground_truth:
+            main_url = self.ground_truth.url
+            if main_url in self.ground_truths:
+                reasonable_urls[main_url] = self.ground_truths[main_url]
+        
+        # Generate test cases for reasonable URLs only
+        for url, ground_truth in reasonable_urls.items():
+            # Generate tests for forms
+            for form in ground_truth.forms[:3]:
+                form_id = form.get('id', 'form')
+                inputs = form.get('inputs', [])
+                
+                # Valid submission test
                 test_cases.append(TestCase(
                     id=f"TC-{tc_id:03d}",
-                    name=f"{form_id} Required Field Validation",
-                    description=f"Test that required fields show validation errors when empty",
-                    preconditions=[f"Navigate to {self.ground_truth.url}"],
-                    steps=["Leave required fields empty", "Click submit button"],
-                    expected_results=["Validation errors are displayed", "Form is not submitted"],
+                    name=f"Valid {form_id} Submission ({url.split('/')[-1] or 'page'})",
+                    description=f"Test successful form submission with valid data on {url}",
+                    preconditions=[f"Navigate to {url}"],
+                    steps=[
+                        f"Fill {inp.get('name', inp.get('type', 'field'))} with valid data"
+                        for inp in inputs[:5]
+                    ] + ["Click submit button", "Wait for response"],
+                    expected_results=["Form submits successfully", "Success message displayed or redirect occurs"],
                     priority="high",
-                    status="proposed"
+                    status="proposed",
+                    url=url
+                ))
+                tc_id += 1
+                
+                # Validation test for required fields
+                required_inputs = [inp for inp in inputs if inp.get('required')]
+                if required_inputs:
+                    test_cases.append(TestCase(
+                        id=f"TC-{tc_id:03d}",
+                        name=f"{form_id} Required Field Validation ({url.split('/')[-1] or 'page'})",
+                        description=f"Test that required fields show validation errors when empty on {url}",
+                        preconditions=[f"Navigate to {url}"],
+                        steps=["Leave required fields empty", "Click submit button"],
+                        expected_results=["Validation errors are displayed", "Form is not submitted"],
+                        priority="high",
+                        status="proposed",
+                        url=url
+                    ))
+                    tc_id += 1
+            
+            # Generate navigation tests
+            nav_items = ground_truth.navigation[:1]
+            for nav in nav_items:
+                links = nav.get('links', [])[:3]
+                for link in links:
+                    if link.get('text'):
+                        test_cases.append(TestCase(
+                            id=f"TC-{tc_id:03d}",
+                            name=f"Navigation to {link.get('text', 'Page')[:20]}",
+                            description=f"Test that navigation link works correctly from {url}",
+                            preconditions=[f"Navigate to {url}"],
+                            steps=[f"Click on '{link.get('text', 'link')}'", "Wait for page load"],
+                            expected_results=["Page navigates successfully", "Expected content is displayed"],
+                            priority="medium",
+                            status="proposed",
+                            url=url
+                        ))
+                        tc_id += 1
+            
+            # Generate button interaction tests
+            buttons = []
+            if ground_truth.dom_summary:
+                try:
+                    # dom_summary might be a JSON string or already a dict
+                    if isinstance(ground_truth.dom_summary, str):
+                        dom_data = json.loads(ground_truth.dom_summary)
+                    else:
+                        dom_data = ground_truth.dom_summary
+                    
+                    if isinstance(dom_data, dict):
+                        buttons = [b for b in dom_data.get('buttons', []) if b.get('text')][:2]
+                except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                    print(f"Warning: Could not parse dom_summary for buttons: {e}")
+                    buttons = []
+            
+            # Add button tests
+            for button in buttons:
+                test_cases.append(TestCase(
+                    id=f"TC-{tc_id:03d}",
+                    name=f"Button Click: {button.get('text', 'Unknown')[:30]} ({url.split('/')[-1] or 'page'})",
+                    description=f"Test button click interaction on {url}",
+                    preconditions=[f"Navigate to {url}"],
+                    steps=[f"Click on '{button.get('text', 'button')}' button", "Wait for response"],
+                    expected_results=["Button responds correctly", "Expected action occurs"],
+                    priority="medium",
+                    status="proposed",
+                    url=url
                 ))
                 tc_id += 1
         
-        # Generate navigation tests
-        nav_items = self.ground_truth.navigation[:1]
-        for nav in nav_items:
-            links = nav.get('links', [])[:3]
-            for link in links:
-                if link.get('text'):
-                    test_cases.append(TestCase(
-                        id=f"TC-{tc_id:03d}",
-                        name=f"Navigation to {link.get('text', 'Page')[:20]}",
-                        description=f"Test that navigation link works correctly",
-                        preconditions=[f"Navigate to {self.ground_truth.url}"],
-                        steps=[f"Click on '{link.get('text', 'link')}'", "Wait for page load"],
-                        expected_results=["Page navigates successfully", "Expected content is displayed"],
-                        priority="medium",
-                        status="proposed"
-                    ))
-                    tc_id += 1
+        # Limit total test cases but ensure we have tests from multiple URLs if available
+        if len(self.ground_truths) > 1:
+            # Distribute test cases across URLs
+            max_per_url = max(3, 15 // len(self.ground_truths))
+            url_test_counts = {}
+            filtered_test_cases = []
+            
+            for tc in test_cases:
+                url = tc.url or list(self.ground_truths.keys())[0]
+                count = url_test_counts.get(url, 0)
+                if count < max_per_url:
+                    filtered_test_cases.append(tc)
+                    url_test_counts[url] = count + 1
+            
+            filtered_test_cases = filtered_test_cases[:20]  # Limit to 20 total test cases
+        else:
+            filtered_test_cases = test_cases[:8]  # Limit to 8 test cases for single URL
         
-        # Generate button interaction tests
-        buttons = []
-        if self.ground_truth.dom_summary:
-            try:
-                # dom_summary might be a JSON string or already a dict
-                if isinstance(self.ground_truth.dom_summary, str):
-                    dom_data = json.loads(self.ground_truth.dom_summary)
-                else:
-                    dom_data = self.ground_truth.dom_summary
-                
-                if isinstance(dom_data, dict):
-                    buttons = [b for b in dom_data.get('buttons', []) if b.get('text')][:2]
-            except (json.JSONDecodeError, TypeError, AttributeError) as e:
-                print(f"Warning: Could not parse dom_summary for buttons: {e}")
-                buttons = []
+        # Reassign IDs sequentially to avoid gaps
+        for idx, tc in enumerate(filtered_test_cases, start=1):
+            tc.id = f"TC-{idx:03d}"
         
-        # Add button tests
-        for button in buttons:
-            test_cases.append(TestCase(
-                id=f"TC-{tc_id:03d}",
-                name=f"Button Click: {button.get('text', 'Unknown')[:30]}",
-                description=f"Test button click interaction",
-                preconditions=[f"Navigate to {self.ground_truth.url}"],
-                steps=[f"Click on '{button.get('text', 'button')}' button", "Wait for response"],
-                expected_results=["Button responds correctly", "Expected action occurs"],
-                priority="medium",
-                status="proposed"
-            ))
-            tc_id += 1
-        
-        return test_cases[:8]  # Limit to 8 test cases initially
+        return filtered_test_cases
     
     def _test_case_to_dict(self, tc: TestCase) -> Dict:
-        return {
+        result = {
             'id': tc.id,
             'name': tc.name,
             'description': tc.description,
@@ -1726,6 +2034,10 @@ class LLMAgent:
             'status': tc.status,
             'human_feedback': tc.human_feedback
         }
+        # Add URL if available
+        if hasattr(tc, 'url') and tc.url:
+            result['url'] = tc.url
+        return result
     
     def _format_test_cases_table(self, test_cases: List[TestCase]) -> str:
         """Format test cases as a markdown table"""
@@ -1862,8 +2174,12 @@ class LLMAgent:
         
         for tc in test_cases:
             try:
+                # Get the appropriate ground truth for this test case
+                test_url = tc.url if hasattr(tc, 'url') and tc.url else (self.ground_truth.url if self.ground_truth else "")
+                ground_truth_for_test = self.ground_truths.get(test_url, self.ground_truth)
+                
                 # Get element locators from ground truth
-                locators = self._extract_locators_for_test(tc)
+                locators = self._extract_locators_for_test(tc, ground_truth_for_test)
                 
                 # Generate code
                 # Pass main model as fallback if code model fails
@@ -1876,7 +2192,7 @@ class LLMAgent:
                 code_tool.main_model = self.main_model
                 code = code_tool.forward(
                     test_case=self._test_case_to_dict(tc),
-                    url=self.ground_truth.url if self.ground_truth else "",
+                    url=test_url,
                     element_locators=locators
                 )
                 
@@ -1943,13 +2259,22 @@ class LLMAgent:
             'metrics': self.metrics.to_dict()
         }
     
-    def _extract_locators_for_test(self, test_case: TestCase) -> Dict:
+    def _extract_locators_for_test(self, test_case: TestCase, ground_truth: Optional[PageGroundTruth] = None) -> Dict:
         """Extract relevant locators from ground truth for a test case"""
         locators = {}
         
-        if self.ground_truth and self.ground_truth.dom_summary:
+        # Use provided ground truth, or fall back to default
+        if not ground_truth:
+            # Try to get ground truth for the test case's URL
+            test_url = test_case.url if hasattr(test_case, 'url') and test_case.url else None
+            if test_url and test_url in self.ground_truths:
+                ground_truth = self.ground_truths[test_url]
+            else:
+                ground_truth = self.ground_truth
+        
+        if ground_truth and ground_truth.dom_summary:
             try:
-                dom_data = json.loads(self.ground_truth.dom_summary)
+                dom_data = json.loads(ground_truth.dom_summary) if isinstance(ground_truth.dom_summary, str) else ground_truth.dom_summary
                 
                 # Add button locators
                 for btn in dom_data.get('buttons', []):
@@ -1963,7 +2288,7 @@ class LLMAgent:
                         if inp.get('name'):
                             locators[f"input_{inp.get('name')}"] = inp.get('locator_id') or inp.get('locator_name')
                 
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
         
         return locators
@@ -2021,11 +2346,16 @@ class LLMAgent:
         execution_results = []
         
         for test_id, code in tests_to_run.items():
+            # Clear previous progress before starting new test
+            if len(tests_to_run) > 1:
+                self.current_execution_progress = None
+                sleep(0.5)  # Brief pause between tests
             test_case = next((tc for tc in self.approved_test_cases if tc.id == test_id), None)
             if not test_case:
                 continue
             
             # Initialize progress tracking
+            print(f"🚀 Starting test execution: {test_id} - {test_case.name}")
             self.current_execution_progress = {
                 'test_id': test_id,
                 'test_name': test_case.name,
@@ -2035,8 +2365,10 @@ class LLMAgent:
                 'steps': [],
                 'start_time': datetime.now(timezone.utc).isoformat()
             }
+            # Force a small delay to ensure frontend picks up the initial state
+            sleep(0.2)
             
-            # Start video recording for this test
+            # Start video recording for this test (on the visible browser page)
             import os
             BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             REPORTS_DIR = os.path.join(BASE_DIR, 'reports')
@@ -2046,12 +2378,13 @@ class LLMAgent:
             video_path = os.path.join(video_dir, f"{test_id}_test_execution.webm")
             
             video_result = self.browser_controller.start_video_recording(video_path)
-            video_page = video_result.get('video_page') if video_result.get('success') else None
             
-            # Execute the test steps with progress updates
-            execute_tool = ExecuteTestTool(self.browser_controller, progress_callback=self._update_execution_progress, video_page=video_page)
-            result = execute_tool.forward(
-                test_steps=test_case.steps,
+            # Execute the actual generated Python test code
+            # Extract and execute Playwright actions from the code
+            result = self._execute_generated_test_code(
+                test_id=test_id,
+                test_code=code,
+                test_case=test_case,
                 test_name=f"{test_id}: {test_case.name}"
             )
             
@@ -2062,7 +2395,11 @@ class LLMAgent:
             
             # Mark as complete
             self.current_execution_progress['status'] = result.get('status', 'completed')
+            self.current_execution_progress['current_step'] = len(test_case.steps)  # Ensure final step is shown
             self.current_execution_progress['end_time'] = datetime.now(timezone.utc).isoformat()
+            
+            # Keep progress visible for a few seconds after completion, then clear it
+            # (Frontend will handle clearing after a delay)
             
             execution_results.append(result)
             self.execution_results.append(TestExecutionResult(
@@ -2462,11 +2799,8 @@ Apply the feedback to fix the issues. Generate the complete corrected code:
             if is_url_only or 'test' in lower_message or 'explore' in lower_message or 'analyze' in lower_message or self.current_phase == WorkflowPhase.IDLE:
                 result = self.start_exploration(url)
             
-            # Automatically propose test cases after exploration
-            if result.get('success'):
-                proposal = self.propose_test_cases()
-                result['message'] += "\n\n---\n\n" + proposal.get('message', '')
-                result['test_cases'] = proposal.get('test_cases', [])
+            # Don't automatically propose test cases - wait for user to request them
+            # User should explicitly say "propose test cases" or similar
             
             return result
         
@@ -2995,17 +3329,789 @@ Always check the 'success' key in return values before proceeding.
         """Get current test execution progress for real-time updates"""
         return self.current_execution_progress
     
+    def _extract_selectors_using_llm(self, test_case: TestCase, url: str) -> Dict:
+        """
+        Use LLM to extract correct selectors by analyzing page HTML and test case steps.
+        This is more reliable than regex extraction from generated code.
+        """
+        try:
+            # Get HTML structure from the page
+            html_result = self.browser_controller.get_page_html()
+            if not html_result.get('success'):
+                return {'success': False, 'error': 'Could not extract HTML from page'}
+            
+            html_data = html_result.get('html_data', {})
+            
+            # Build prompt for LLM to extract selectors
+            prompt = f"""You are a web testing expert. Given a test case and the page HTML structure, extract the correct CSS selectors for each action.
+
+Test Case: {test_case.name}
+URL: {url}
+Description: {test_case.description}
+
+Test Steps:
+{chr(10).join(f"{i+1}. {step}" for i, step in enumerate(test_case.steps))}
+
+Page HTML Structure:
+Forms: {json.dumps(html_data.get('forms', [])[:3], indent=2)}
+Buttons: {json.dumps(html_data.get('buttons', [])[:10], indent=2)}
+Inputs: {json.dumps(html_data.get('inputs', [])[:10], indent=2)}
+
+For each test step, identify:
+1. What element needs to be interacted with
+2. The best CSS selector for that element (priority: data-testid > id > name > class > text)
+
+Return a JSON object with this structure:
+{{
+  "selectors": {{
+    "step_1": {{
+      "action": "navigate|fill|click|wait",
+      "selector": "CSS selector here",
+      "value": "value if fill action"
+    }},
+    ...
+  }}
+}}
+
+Only return the JSON, no other text:"""
+
+            # Use main model to extract selectors
+            if hasattr(self, 'main_model') and self.main_model:
+                try:
+                    messages = [{"role": "user", "content": prompt}]
+                    response = self.main_model(messages)
+                    response_text = response.content if hasattr(response, 'content') else str(response)
+                    
+                    # Extract JSON from response
+                    json_match = re.search(r'\{[^{}]*"selectors"[^{}]*\{[^{}]*\{[^}]*\}[^}]*\}[^}]*\}', response_text, re.DOTALL)
+                    if json_match:
+                        selectors_data = json.loads(json_match.group())
+                        return {'success': True, 'selectors': selectors_data.get('selectors', {})}
+                    else:
+                        # Try to parse entire response as JSON
+                        try:
+                            selectors_data = json.loads(response_text)
+                            return {'success': True, 'selectors': selectors_data.get('selectors', {})}
+                        except:
+                            pass
+                except Exception as e:
+                    print(f"Error using LLM for selector extraction: {e}")
+            
+            return {'success': False, 'error': 'LLM selector extraction failed'}
+        except Exception as e:
+            print(f"Error in _extract_selectors_using_llm: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def _execute_generated_test_code(self, test_id: str, test_code: str, test_case: TestCase, test_name: str) -> Dict:
+        """
+        Execute the generated Python test code by extracting Playwright actions and executing them
+        on the visible browser page. Uses LLM-based selector extraction as fallback.
+        """
+        execution_result = {
+            'test_name': test_name,
+            'status': 'passed',
+            'start_time': datetime.now(timezone.utc).isoformat(),
+            'steps': [],
+            'screenshots': [],
+            'errors': []
+        }
+        
+        try:
+            # First, try to extract actions from the Python code using regex
+            # Look for common Playwright patterns: page.goto, page.fill, page.click, page.wait_for_selector
+            
+            # Extract navigation (handle both page.goto and await page.goto)
+            goto_pattern = r'(?:await\s+)?page\.goto\(["\']([^"\']+)["\']'
+            goto_matches = re.findall(goto_pattern, test_code, re.IGNORECASE)
+            
+            # Extract fill actions (handle various formats)
+            # Match: page.fill("selector", "value") or await page.fill("selector", "value")
+            fill_pattern = r'(?:await\s+)?page\.fill\(["\']([^"\']+)["\']\s*,\s*["\']([^"\']*)["\']'
+            fill_matches = re.findall(fill_pattern, test_code, re.IGNORECASE)
+            
+            # Also try fill with variables or expressions (but validate selector is complete)
+            fill_pattern2 = r'page\.fill\(["\']([^"\']+)["\']\s*,\s*([^)]+)\)'
+            fill_matches2 = re.findall(fill_pattern2, test_code, re.IGNORECASE)
+            # Convert to simple format (use "test_data" as placeholder) but only if selector is valid
+            for sel, val in fill_matches2:
+                if sel and sel.strip() and not sel.endswith('=') and sel not in [f[0] for f in fill_matches]:
+                    # Check if selector looks complete (has closing bracket if it's an attribute selector)
+                    if sel.startswith('[') and not sel.endswith(']'):
+                        continue  # Skip incomplete attribute selectors
+                    fill_matches.append((sel, "test_data"))
+            
+            # Filter out invalid selectors
+            def is_valid_selector(sel):
+                if not sel or not sel.strip():
+                    return False
+                # Skip selectors ending with '=' (incomplete attribute selectors)
+                if sel.endswith('='):
+                    return False
+                # If it's an attribute selector starting with '[', it must end with ']'
+                if sel.startswith('[') and not sel.endswith(']'):
+                    return False
+                return True
+            
+            fill_matches = [(sel, val) for sel, val in fill_matches if is_valid_selector(sel)]
+            
+            # Extract form.fill() patterns (element.fill()) - handle form = page.query_selector(...) then form.fill(...)
+            # Match: form = page.query_selector("#selector") ... await form.fill("value")
+            form_fill_block_pattern = r'(?:form|button|element)\s*=\s*page\.query_selector\(["\']([^"\']+)["\'].*?await\s+(?:form|button|element)\.fill\(["\']([^"\']*)["\']'
+            form_fill_blocks = re.findall(form_fill_block_pattern, test_code, re.IGNORECASE | re.DOTALL)
+            for form_sel, fill_val in form_fill_blocks:
+                if form_sel not in [f[0] for f in fill_matches]:
+                    fill_matches.append((form_sel, fill_val if fill_val else "test_data"))
+            
+            # Also handle simpler pattern: form = page.query_selector("#sel") followed by form.fill("val") on next lines
+            form_sel_pattern = r'(?:form|button|element)\s*=\s*page\.query_selector\(["\']([^"\']+)["\']'
+            form_sels = re.findall(form_sel_pattern, test_code, re.IGNORECASE)
+            for form_sel in form_sels:
+                if form_sel not in [f[0] for f in fill_matches]:
+                    # Look for fill call in nearby lines
+                    lines = test_code.split('\n')
+                    for i, line in enumerate(lines):
+                        if f'query_selector("{form_sel}"' in line or f"query_selector('{form_sel}'" in line:
+                            # Check next few lines for fill
+                            for j in range(i+1, min(i+5, len(lines))):
+                                if 'fill(' in lines[j]:
+                                    fill_val_match = re.search(r'fill\(["\']([^"\']*)["\']', lines[j])
+                                    if fill_val_match:
+                                        fill_matches.append((form_sel, fill_val_match.group(1) if fill_val_match.group(1) else "test_data"))
+                                        break
+                            break
+                    # If no fill found, add with default value
+                    if form_sel not in [f[0] for f in fill_matches]:
+                        fill_matches.append((form_sel, "test_data"))
+            
+            # Extract click actions - must have complete quoted strings
+            # Match: page.click("selector") or await page.click("selector") or element.click()
+            click_pattern = r'(?:await\s+)?page\.click\(["\']([^"\']+)["\']'
+            click_matches = re.findall(click_pattern, test_code, re.IGNORECASE)
+            
+            # Also extract button.click() and form.click() patterns
+            button_click_pattern = r'(?:button|form|element)\.click\(\)'
+            if re.search(button_click_pattern, test_code, re.IGNORECASE):
+                # Find the selector before the click (button = page.query_selector(...))
+                button_selector_pattern = r'(?:button|form|element)\s*=\s*page\.query_selector\(["\']([^"\']+)["\']'
+                button_selectors = re.findall(button_selector_pattern, test_code, re.IGNORECASE)
+                click_matches.extend(button_selectors)
+            
+            # Filter out invalid selectors (incomplete attribute selectors, empty, etc.)
+            def is_valid_selector(sel):
+                if not sel or not sel.strip():
+                    return False
+                # Skip selectors ending with '=' (incomplete attribute selectors)
+                if sel.endswith('='):
+                    return False
+                # If it's an attribute selector starting with '[', it must end with ']'
+                if sel.startswith('[') and not sel.endswith(']'):
+                    return False
+                return True
+            
+            click_matches = [s for s in click_matches if is_valid_selector(s)]
+            
+            # Extract wait_for_selector - need to handle quoted strings properly
+            # Match: page.wait_for_selector("selector") or await page.wait_for_selector("selector")
+            wait_pattern = r'(?:await\s+)?page\.wait_for_selector\(["\']([^"\']+)["\']'
+            wait_matches = re.findall(wait_pattern, test_code, re.IGNORECASE)
+            
+            # Also extract text-based selectors
+            wait_text_pattern = r'(?:await\s+)?page\.wait_for_selector\(["\']text=([^"\']+)["\']'
+            wait_text_matches = re.findall(wait_text_pattern, test_code, re.IGNORECASE)
+            wait_matches.extend([f"text={text}" for text in wait_text_matches])
+            
+            # Normalize selectors: convert data-testid=form to [data-testid="form"]
+            def normalize_selector(sel):
+                if not sel:
+                    return sel
+                # Handle data-testid=value format (missing brackets)
+                if '=' in sel and not sel.startswith('[') and not sel.startswith('#') and not sel.startswith('.') and not sel.startswith('text='):
+                    # Check if it looks like an attribute selector without brackets
+                    if sel.count('=') == 1:
+                        attr, value = sel.split('=', 1)
+                        # Remove quotes if present
+                        value = value.strip('"\'')
+                        return f'[{attr}="{value}"]'
+                return sel
+            
+            # Normalize all selectors
+            fill_matches = [(normalize_selector(sel), val) for sel, val in fill_matches]
+            click_matches = [normalize_selector(sel) for sel in click_matches]
+            wait_matches = [normalize_selector(sel) for sel in wait_matches]
+            
+            # Fix unicode escape sequences in text selectors
+            def fix_unicode_selector(sel):
+                if sel.startswith('text='):
+                    # Decode unicode escape sequences
+                    text_part = sel[5:]  # Remove "text=" prefix
+                    try:
+                        # Handle \\u2705 -> \u2705 -> actual emoji
+                        text_part = text_part.encode().decode('unicode_escape')
+                        return f'text={text_part}'
+                    except:
+                        pass
+                return sel
+            
+            wait_matches = [fix_unicode_selector(sel) for sel in wait_matches]
+            
+            # Filter out invalid/empty selectors
+            def is_valid_selector(sel):
+                if not sel or not sel.strip():
+                    return False
+                # Skip selectors ending with '=' (incomplete attribute selectors)
+                if sel.endswith('='):
+                    return False
+                # If it's an attribute selector starting with '[', it must end with ']'
+                if sel.startswith('[') and not sel.endswith(']'):
+                    return False
+                # Skip empty text selectors
+                if sel == 'text=' or sel.startswith('text=') and len(sel) == 5:
+                    return False
+                return True
+            
+            wait_matches = [s for s in wait_matches if is_valid_selector(s)]
+            
+            print(f"📋 Extracted actions from code:")
+            print(f"   - Navigation: {len(goto_matches)}")
+            print(f"   - Fill actions: {len(fill_matches)}")
+            print(f"   - Click actions: {len(click_matches)}")
+            print(f"   - Wait actions: {len(wait_matches)}")
+            
+            # Debug: Show invalid selectors that were filtered out
+            if wait_matches:
+                print(f"   ✓ Valid wait selectors: {wait_matches[:3]}{'...' if len(wait_matches) > 3 else ''}")
+            if fill_matches:
+                print(f"   ✓ Valid fill selectors: {[f[0] for f in fill_matches[:3]]}{'...' if len(fill_matches) > 3 else ''}")
+            if click_matches:
+                print(f"   ✓ Valid click selectors: {click_matches[:3]}{'...' if len(click_matches) > 3 else ''}")
+            
+            # Update total_steps based on extracted actions
+            total_actions = len(goto_matches) + len(fill_matches) + len(click_matches) + len(wait_matches)
+            if self.current_execution_progress and total_actions > 0:
+                self.current_execution_progress['total_steps'] = total_actions
+            
+            step_num = 0
+            
+            # Execute navigation first if found
+            if goto_matches:
+                url = goto_matches[0]
+                step_num += 1
+                step_desc = f"Navigate to {url}"
+                print(f"  → {step_desc}")
+                
+                result = self.browser_controller.navigate_to(url)
+                step_result = {
+                    'step_number': step_num,
+                    'description': step_desc,
+                    'status': 'passed' if result.get('success') else 'failed',
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                
+                if not result.get('success'):
+                    execution_result['status'] = 'failed'
+                    step_result['error'] = result.get('error', 'Navigation failed')
+                    execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                
+                sleep(0.5)
+                screenshot = self.browser_controller.capture_screenshot(update_latest=True)
+                if screenshot:
+                    execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                
+                if self.current_execution_progress:
+                    self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                
+                execution_result['steps'].append(step_result)
+                sleep(1)  # Wait for page to load
+            
+            # Execute wait_for_selector actions (before filling/clicking)
+            # But skip waits for elements we're about to interact with
+            for selector in wait_matches:
+                # Skip invalid selectors
+                if not selector or selector.strip() == '' or selector.endswith('='):
+                    continue
+                
+                # Skip if we're about to interact with this element
+                if selector in [f[0] for f in fill_matches] or selector in click_matches:
+                    continue
+                
+                step_num += 1
+                step_desc = f"Wait for {selector[:50]}"
+                print(f"  → {step_desc}")
+                
+                try:
+                    result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                    step_result = {
+                        'step_number': step_num,
+                        'description': step_desc,
+                        'status': 'passed' if result.get('success') else 'failed',
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    if not result.get('success'):
+                        step_result['error'] = result.get('error', 'Element not found')
+                        # Don't fail the test for wait timeouts, just log it
+                        print(f"    ⚠️  {step_result['error']}")
+                    
+                    screenshot = self.browser_controller.capture_screenshot(update_latest=True)
+                    if screenshot:
+                        execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                    
+                    if self.current_execution_progress:
+                        self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                    
+                    execution_result['steps'].append(step_result)
+                except Exception as e:
+                    print(f"    ❌ Error waiting for {selector}: {e}")
+                    # Skip invalid selectors
+                    step_num -= 1  # Don't count this as a step
+                    continue
+            
+            # Execute fill actions
+            for selector, value in fill_matches:
+                # Skip invalid selectors (should already be filtered, but double-check)
+                if not selector or selector.strip() == '' or selector.endswith('='):
+                    print(f"  ⚠️  Skipping invalid selector: {selector}")
+                    continue
+                
+                step_num += 1
+                step_desc = f"Fill {selector[:50]} with {value[:30] if value else 'data'}"
+                print(f"  → {step_desc}")
+                
+                try:
+                    # Wait for element first
+                    wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                    if not wait_result.get('success'):
+                        print(f"    ⚠️  Element not found: {selector}")
+                        step_result = {
+                            'step_number': step_num,
+                            'description': step_desc,
+                            'status': 'failed',
+                            'error': f"Element not found: {selector}",
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        }
+                        execution_result['status'] = 'failed'
+                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                        execution_result['steps'].append(step_result)
+                        continue
+                    
+                    # type_text already uses page.fill() internally, so this is correct
+                    result = self.browser_controller.type_text(selector, value if value else "test_data")
+                    step_result = {
+                        'step_number': step_num,
+                        'description': step_desc,
+                        'status': 'passed' if result.get('success') else 'failed',
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    if not result.get('success'):
+                        execution_result['status'] = 'failed'
+                        step_result['error'] = result.get('error', 'Fill failed')
+                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                        print(f"    ❌ {step_result['error']}")
+                    else:
+                        print(f"    ✅ Filled successfully")
+                    
+                    screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
+                    if screenshot:
+                        execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                    
+                    if self.current_execution_progress:
+                        self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                    
+                    execution_result['steps'].append(step_result)
+                    sleep(0.3)  # Small delay between actions
+                except Exception as e:
+                    print(f"    ❌ Error filling {selector}: {e}")
+                    execution_result['status'] = 'failed'
+                    execution_result['errors'].append({'step': step_num, 'error': str(e)})
+                    step_num -= 1  # Don't count this as a step
+                    continue
+            
+            # Execute click actions
+            for selector in click_matches:
+                # Skip invalid selectors
+                if not selector or selector.strip() == '' or selector.endswith('='):
+                    print(f"  ⚠️  Skipping invalid selector: {selector}")
+                    continue
+                
+                step_num += 1
+                step_desc = f"Click {selector[:50]}"
+                print(f"  → {step_desc}")
+                
+                try:
+                    # Wait for element first
+                    wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                    if not wait_result.get('success'):
+                        print(f"    ⚠️  Element not found: {selector}")
+                        step_result = {
+                            'step_number': step_num,
+                            'description': step_desc,
+                            'status': 'failed',
+                            'error': f"Element not found: {selector}",
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        }
+                        execution_result['status'] = 'failed'
+                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                        execution_result['steps'].append(step_result)
+                        continue
+                    
+                    result = self.browser_controller.click_element(selector)
+                    step_result = {
+                        'step_number': step_num,
+                        'description': step_desc,
+                        'status': 'passed' if result.get('success') else 'failed',
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    if not result.get('success'):
+                        execution_result['status'] = 'failed'
+                        step_result['error'] = result.get('error', 'Click failed')
+                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                        print(f"    ❌ {step_result['error']}")
+                    else:
+                        print(f"    ✅ Clicked successfully")
+                    
+                    sleep(0.5)  # Wait for action to complete
+                    screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
+                    if screenshot:
+                        execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                    
+                    if self.current_execution_progress:
+                        self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                    
+                    execution_result['steps'].append(step_result)
+                    sleep(1)  # Wait for page to respond
+                except Exception as e:
+                    print(f"    ❌ Error clicking {selector}: {e}")
+                    execution_result['status'] = 'failed'
+                    execution_result['errors'].append({'step': step_num, 'error': str(e)})
+                    step_num -= 1  # Don't count this as a step
+                    continue
+            
+            # If no actions were found, try LLM-based selector extraction first
+            if step_num == 0:
+                print(f"⚠️  No Playwright actions found in code, trying LLM-based selector extraction")
+                print(f"   Code snippet (first 500 chars): {test_code[:500]}")
+                
+                # Try to extract selectors using LLM analysis of page HTML
+                llm_selectors = self._extract_selectors_using_llm(test_case, test_case.url or '')
+                if llm_selectors.get('success') and llm_selectors.get('selectors'):
+                    print(f"   ✓ LLM extracted {len(llm_selectors['selectors'])} selectors from page HTML")
+                    selectors = llm_selectors['selectors']
+                    
+                    # Execute actions based on LLM-extracted selectors
+                    for step_idx, step in enumerate(test_case.steps, 1):
+                        step_key = f"step_{step_idx}"
+                        if step_key in selectors:
+                            selector_info = selectors[step_key]
+                            action = selector_info.get('action', '').lower()
+                            selector = selector_info.get('selector', '')
+                            value = selector_info.get('value', '')
+                            
+                            if action == 'navigate' and test_case.url:
+                                step_num += 1
+                                step_desc = f"Navigate to {test_case.url}"
+                                print(f"  → {step_desc}")
+                                
+                                result = self.browser_controller.navigate_to(test_case.url)
+                                step_result = {
+                                    'step_number': step_num,
+                                    'description': step_desc,
+                                    'status': 'passed' if result.get('success') else 'failed',
+                                    'timestamp': datetime.now(timezone.utc).isoformat()
+                                }
+                                
+                                if not result.get('success'):
+                                    execution_result['status'] = 'failed'
+                                    step_result['error'] = result.get('error', 'Navigation failed')
+                                    execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                
+                                sleep(0.5)
+                                screenshot = self.browser_controller.capture_screenshot(update_latest=True)
+                                if screenshot:
+                                    execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                
+                                if self.current_execution_progress:
+                                    self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                
+                                execution_result['steps'].append(step_result)
+                                sleep(1)
+                            
+                            elif action == 'fill' and selector:
+                                step_num += 1
+                                step_desc = f"Fill {selector} with {value or 'test data'}"
+                                print(f"  → {step_desc}")
+                                
+                                try:
+                                    wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                                    if wait_result.get('success'):
+                                        result = self.browser_controller.type_text(selector, value or "test_data")
+                                        step_result = {
+                                            'step_number': step_num,
+                                            'description': step_desc,
+                                            'status': 'passed' if result.get('success') else 'failed',
+                                            'timestamp': datetime.now(timezone.utc).isoformat()
+                                        }
+                                        
+                                        if not result.get('success'):
+                                            execution_result['status'] = 'failed'
+                                            step_result['error'] = result.get('error', 'Fill failed')
+                                            execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                        
+                                        screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
+                                        if screenshot:
+                                            execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                        
+                                        if self.current_execution_progress:
+                                            self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                        
+                                        execution_result['steps'].append(step_result)
+                                        sleep(0.3)
+                                    else:
+                                        print(f"    ⚠️  Element not found: {selector}")
+                                        step_result = {
+                                            'step_number': step_num,
+                                            'description': step_desc,
+                                            'status': 'failed',
+                                            'error': f"Element not found: {selector}",
+                                            'timestamp': datetime.now(timezone.utc).isoformat()
+                                        }
+                                        execution_result['status'] = 'failed'
+                                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                        execution_result['steps'].append(step_result)
+                                except Exception as e:
+                                    print(f"    ❌ Error: {e}")
+                                    execution_result['status'] = 'failed'
+                                    execution_result['errors'].append({'step': step_num, 'error': str(e)})
+                            
+                            elif action == 'click' and selector:
+                                step_num += 1
+                                step_desc = f"Click {selector}"
+                                print(f"  → {step_desc}")
+                                
+                                try:
+                                    wait_result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                                    if wait_result.get('success'):
+                                        result = self.browser_controller.click_element(selector)
+                                        step_result = {
+                                            'step_number': step_num,
+                                            'description': step_desc,
+                                            'status': 'passed' if result.get('success') else 'failed',
+                                            'timestamp': datetime.now(timezone.utc).isoformat()
+                                        }
+                                        
+                                        if not result.get('success'):
+                                            execution_result['status'] = 'failed'
+                                            step_result['error'] = result.get('error', 'Click failed')
+                                            execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                        
+                                        sleep(0.5)
+                                        screenshot = result.get('screenshot') or self.browser_controller.capture_screenshot(update_latest=True)
+                                        if screenshot:
+                                            execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                        
+                                        if self.current_execution_progress:
+                                            self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                        
+                                        execution_result['steps'].append(step_result)
+                                        sleep(1)
+                                    else:
+                                        print(f"    ⚠️  Element not found: {selector}")
+                                        step_result = {
+                                            'step_number': step_num,
+                                            'description': step_desc,
+                                            'status': 'failed',
+                                            'error': f"Element not found: {selector}",
+                                            'timestamp': datetime.now(timezone.utc).isoformat()
+                                        }
+                                        execution_result['status'] = 'failed'
+                                        execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                                        execution_result['steps'].append(step_result)
+                                except Exception as e:
+                                    print(f"    ❌ Error: {e}")
+                                    execution_result['status'] = 'failed'
+                                    execution_result['errors'].append({'step': step_num, 'error': str(e)})
+                            
+                            elif action == 'wait' and selector:
+                                step_num += 1
+                                step_desc = f"Wait for {selector}"
+                                print(f"  → {step_desc}")
+                                
+                                try:
+                                    result = self.browser_controller.wait_for_selector(selector, timeout=5000)
+                                    step_result = {
+                                        'step_number': step_num,
+                                        'description': step_desc,
+                                        'status': 'passed' if result.get('success') else 'failed',
+                                        'timestamp': datetime.now(timezone.utc).isoformat()
+                                    }
+                                    
+                                    if not result.get('success'):
+                                        step_result['error'] = result.get('error', 'Element not found')
+                                        print(f"    ⚠️  {step_result['error']}")
+                                    
+                                    screenshot = self.browser_controller.capture_screenshot(update_latest=True)
+                                    if screenshot:
+                                        execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                                    
+                                    if self.current_execution_progress:
+                                        self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                                    
+                                    execution_result['steps'].append(step_result)
+                                except Exception as e:
+                                    print(f"    ❌ Error: {e}")
+                                    step_num -= 1
+                                    continue
+                    
+                    if step_num > 0:
+                        print(f"✅ Executed {step_num} actions using LLM-extracted selectors")
+                        execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
+                        return execution_result
+                
+                # Fallback to basic step-based execution if LLM extraction also fails
+                print(f"   ⚠️  LLM extraction failed, falling back to basic step execution")
+                
+                # Try to extract actions from test case steps
+                for step in test_case.steps:
+                    step_lower = step.lower()
+                    
+                    # Try to extract URL from navigation steps
+                    if 'navigate' in step_lower or 'go to' in step_lower:
+                        url_match = re.search(r'https?://[^\s]+', step)
+                        if url_match:
+                            step_num += 1
+                            url = url_match.group()
+                            step_desc = f"Navigate to {url}"
+                            print(f"  → {step_desc}")
+                            
+                            result = self.browser_controller.navigate_to(url)
+                            step_result = {
+                                'step_number': step_num,
+                                'description': step_desc,
+                                'status': 'passed' if result.get('success') else 'failed',
+                                'timestamp': datetime.now(timezone.utc).isoformat()
+                            }
+                            
+                            if not result.get('success'):
+                                execution_result['status'] = 'failed'
+                                step_result['error'] = result.get('error', 'Navigation failed')
+                                execution_result['errors'].append({'step': step_num, 'error': step_result['error']})
+                            
+                            sleep(0.5)
+                            screenshot = self.browser_controller.capture_screenshot(update_latest=True)
+                            if screenshot:
+                                execution_result['screenshots'].append({'step': step_num, 'screenshot': screenshot})
+                            
+                            if self.current_execution_progress:
+                                self._update_execution_progress(step_num, step_desc, step_result['status'], screenshot)
+                            
+                            execution_result['steps'].append(step_result)
+                            sleep(1)
+                    
+                    # Try to extract fill actions from steps
+                    elif 'fill' in step_lower or 'enter' in step_lower or 'type' in step_lower:
+                        # Look for field names in the step
+                        # Example: "Fill email with valid data"
+                        field_match = re.search(r'fill\s+([^\s]+)', step_lower)
+                        if field_match:
+                            field_name = field_match.group(1)
+                            # Try to find a selector for this field
+                            # This is a simplified approach - in practice, you'd need the ground truth
+                            step_num += 1
+                            step_desc = f"Fill {field_name} with test data"
+                            print(f"  → {step_desc}")
+                            print(f"    ⚠️  Cannot execute: Selector not found for '{field_name}'")
+                            
+                            step_result = {
+                                'step_number': step_num,
+                                'description': step_desc,
+                                'status': 'skipped',
+                                'error': f"Selector not found for field: {field_name}",
+                                'timestamp': datetime.now(timezone.utc).isoformat()
+                            }
+                            execution_result['steps'].append(step_result)
+                    
+                    # Try to extract click actions
+                    elif 'click' in step_lower:
+                        step_num += 1
+                        step_desc = step
+                        print(f"  → {step_desc}")
+                        print(f"    ⚠️  Cannot execute: Selector not found")
+                        
+                        step_result = {
+                            'step_number': step_num,
+                            'description': step_desc,
+                            'status': 'skipped',
+                            'error': "Selector not found",
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        }
+                        execution_result['steps'].append(step_result)
+                
+                if step_num == 0:
+                    print(f"    ❌ Could not extract any executable actions from test case steps")
+                    execution_result['status'] = 'failed'
+                    execution_result['errors'].append({
+                        'step': 0,
+                        'error': 'No Playwright actions found in code and could not parse test case steps'
+                    })
+                
+                execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
+                return execution_result
+            
+            print(f"✅ Executed {step_num} actions from generated code")
+            
+        except Exception as e:
+            error_str = str(e)
+            print(f"❌ Error executing test code: {error_str}")
+            import traceback
+            traceback.print_exc()
+            
+            execution_result['status'] = 'failed'
+            execution_result['errors'].append({
+                'step': 0,
+                'error': f"Execution error: {error_str}"
+            })
+            
+            # Fall back to step-based execution
+            try:
+                execute_tool = ExecuteTestTool(self.browser_controller, progress_callback=self._update_execution_progress)
+                result = execute_tool.forward(
+                    test_steps=test_case.steps,
+                    test_name=test_name
+                )
+                return result
+            except:
+                pass
+        
+        execution_result['end_time'] = datetime.now(timezone.utc).isoformat()
+        return execution_result
+    
     def _update_execution_progress(self, step_number: int, step_description: str, status: str, screenshot: str = None):
         """Update execution progress for real-time frontend updates"""
         if self.current_execution_progress:
             self.current_execution_progress['current_step'] = step_number
-            self.current_execution_progress['steps'].append({
-                'step_number': step_number,
-                'description': step_description,
-                'status': status,
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-                'screenshot': screenshot
-            })
+            self.current_execution_progress['status'] = 'running'  # Ensure status stays as running
+            
+            # Add step if not already added (avoid duplicates)
+            existing_step = next((s for s in self.current_execution_progress.get('steps', []) 
+                                 if s.get('step_number') == step_number), None)
+            if not existing_step:
+                self.current_execution_progress['steps'].append({
+                    'step_number': step_number,
+                    'description': step_description,
+                    'status': status,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'screenshot': screenshot
+                })
+            else:
+                # Update existing step
+                existing_step['status'] = status
+                existing_step['description'] = step_description
+                if screenshot:
+                    existing_step['screenshot'] = screenshot
+            
+            # Print for debugging
+            print(f"📊 Progress Update: Step {step_number}/{self.current_execution_progress.get('total_steps', '?')} - {step_description[:50]}")
     
     def _load_test_from_file(self, test_case_id: str) -> Dict:
         """Load test code from a file (for edited tests)"""

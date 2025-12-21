@@ -48,12 +48,47 @@ const BrowserView = ({ screenshot, url, loading = false, executionProgress = nul
         {url && <span className="browser-url">{url}</span>}
       </div>
       
-      {/* Execution Progress Panel */}
-      {executionProgress && (executionProgress.status === 'running' || executionProgress.status === 'completed') && (
-        <div className="execution-progress-panel">
+      {/* Prominent Test Execution Banner */}
+      {executionProgress && executionProgress.status === 'running' && (
+        <div style={{
+          backgroundColor: '#3b82f6',
+          color: 'white',
+          padding: '12px 16px',
+          borderRadius: '8px',
+          marginBottom: '16px',
+          fontWeight: 'bold',
+          fontSize: '16px',
+          textAlign: 'center',
+          boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+        }}>
+          ⏳ Testing {executionProgress.test_id || 'Test'} - Step {executionProgress.current_step || 0} of {executionProgress.total_steps || 0}
+        </div>
+      )}
+      
+      {/* Execution Progress Panel - Show prominently when running */}
+      {executionProgress && (
+        <div className="execution-progress-panel" style={{
+          border: executionProgress.status === 'running' ? '2px solid #3b82f6' : '1px solid #e5e7eb',
+          backgroundColor: executionProgress.status === 'running' ? '#eff6ff' : '#f9fafb'
+        }}>
           <div className="progress-header">
-            <h3>🧪 Testing: {executionProgress.test_id}</h3>
-            <span className="progress-status">{executionProgress.test_name}</span>
+            <h3 style={{ 
+              color: executionProgress.status === 'running' ? '#1e40af' : '#374151',
+              fontSize: '18px',
+              fontWeight: 'bold',
+              margin: 0
+            }}>
+              {executionProgress.status === 'running' ? '⏳' : executionProgress.status === 'completed' ? '✅' : '🧪'} 
+              {' '}Testing: {executionProgress.test_id || 'Unknown'}
+            </h3>
+            <span className="progress-status" style={{ 
+              fontSize: '14px',
+              color: '#6b7280',
+              marginTop: '4px',
+              display: 'block'
+            }}>
+              {executionProgress.test_name || 'Test Execution'}
+            </span>
             {executionProgress.status === 'completed' && (
               <span className="completed-badge" style={{ 
                 backgroundColor: '#10b981', 
@@ -77,9 +112,16 @@ const BrowserView = ({ screenshot, url, loading = false, executionProgress = nul
               }}
             />
           </div>
-          <div className="progress-info">
-            Step {executionProgress.current_step} of {executionProgress.total_steps}
-            {executionProgress.status === 'completed' && ' - All steps completed!'}
+          <div className="progress-info" style={{
+            fontSize: '14px',
+            fontWeight: executionProgress.status === 'running' ? '600' : '400',
+            color: executionProgress.status === 'running' ? '#1e40af' : '#374151',
+            marginTop: '8px'
+          }}>
+            {executionProgress.status === 'running' && '🔄 '}
+            Step {executionProgress.current_step || 0} of {executionProgress.total_steps || 0}
+            {executionProgress.status === 'completed' && ' - ✅ All steps completed!'}
+            {executionProgress.status === 'running' && ' - In progress...'}
           </div>
           <div className="steps-list">
             {executionProgress.steps && executionProgress.steps.map((step, index) => {

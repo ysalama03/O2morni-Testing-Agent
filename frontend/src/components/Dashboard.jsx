@@ -21,46 +21,94 @@ const Dashboard = () => {
   const [executionProgress, setExecutionProgress] = useState(null);
 
   useEffect(() => {
-    // Poll for updates periodically
-    const interval = setInterval(async () => {
+    let intervalId = null;
+    let isPolling = true;
+    
+    const pollForUpdates = async () => {
+      if (!isPolling) return;
+      
       try {
-        // Always request screenshots to get real-time updates during agent execution
-        // The backend caches the latest screenshot, so this is efficient
-        const [browserData, metricsData, progressData] = await Promise.all([
-          getBrowserState(true),  // Always request screenshot for real-time updates
-          getMetrics(),
-          getExecutionProgress().catch(() => ({ progress: null }))  // Get execution progress
-        ]);
+        // Check execution progress first (lightweight check)
+        const progressData = await getExecutionProgress().catch(() => ({ progress: null }));
         
-        // Update browser state with latest screenshot (backend returns cached latest)
-        setBrowserState(prev => ({
-          ...prev,
-          ...browserData,
-          // Update screenshot if provided (backend returns latest cached screenshot)
-          screenshot: browserData.screenshot || prev.screenshot,
-          // Always update URL and loading state
-          url: browserData.url || prev.url,
-          loading: browserData.loading || false
-        }));
+        // If test is running, poll more frequently and get all updates
+        const isTestRunning = progressData && progressData.progress && progressData.progress.status === 'running';
         
-        if (metricsData) {
-          setMetrics(prev => ({ ...prev, ...metricsData }));
-        }
-        
-        // Update execution progress if available
-        if (progressData && progressData.progress) {
+        if (isTestRunning) {
+          // Test is running - get all updates including screenshots
+          const [browserData, metricsData] = await Promise.all([
+            getBrowserState(true),  // Request screenshot for real-time updates
+            getMetrics()
+          ]);
+          
+          setBrowserState(prev => ({
+            ...prev,
+            ...browserData,
+            screenshot: browserData.screenshot || prev.screenshot,
+            url: browserData.url || prev.url,
+            loading: browserData.loading || false
+          }));
+          
+          if (metricsData) {
+            setMetrics(prev => ({ ...prev, ...metricsData }));
+          }
+          
           setExecutionProgress(progressData.progress);
-        } else if (progressData && !progressData.progress) {
-          // Clear progress if execution is complete
-          setExecutionProgress(null);
+          
+          // Poll every 500ms when test is running
+          intervalId = setTimeout(pollForUpdates, 500);
+        } else {
+          // No test running - poll less frequently (every 3 seconds)
+          const [browserData, metricsData] = await Promise.all([
+            getBrowserState(false),  // Don't request screenshot when idle (saves bandwidth)
+            getMetrics()
+          ]);
+          
+          setBrowserState(prev => ({
+            ...prev,
+            url: browserData.url || prev.url,
+            loading: browserData.loading || false
+            // Keep existing screenshot when idle
+          }));
+          
+          if (metricsData) {
+            setMetrics(prev => ({ ...prev, ...metricsData }));
+          }
+          
+          // Update execution progress
+          if (progressData && progressData.progress) {
+            setExecutionProgress(progressData.progress);
+            
+            // If execution is completed, keep it visible for 5 seconds then clear
+            if (progressData.progress.status === 'completed') {
+              setTimeout(() => {
+                setExecutionProgress(null);
+              }, 5000);
+            }
+          } else {
+            setExecutionProgress(null);
+          }
+          
+          // Poll every 3 seconds when idle
+          intervalId = setTimeout(pollForUpdates, 3000);
         }
       } catch (error) {
         console.error('Error fetching updates:', error);
+        // Retry after 3 seconds on error
+        intervalId = setTimeout(pollForUpdates, 3000);
       }
-    }, 1000);  // Poll every 1 second for more responsive real-time updates during test execution
+    };
+    
+    // Start polling
+    pollForUpdates();
 
-    return () => clearInterval(interval);
-  }, []);
+    return () => {
+      isPolling = false;
+      if (intervalId) {
+        clearTimeout(intervalId);
+      }
+    };
+  }, []); // Only run once on mount
 
   const handleReset = async () => {
     if (window.confirm('Are you sure you want to reset the agent? This will clear all test data and allow you to start testing a new website.')) {
